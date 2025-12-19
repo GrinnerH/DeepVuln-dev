@@ -1,0 +1,7 @@
+data/
+!data/reference_cases/
+.env
+.uvcache
+__pycache__/
+.langgraph_api/
+trace/

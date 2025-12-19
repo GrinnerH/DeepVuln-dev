@@ -1,0 +1,17 @@
+Jinja2==3.1.6
+json_repair==0.54.2
+langchain==1.1.2
+langchain_chroma==1.0.0
+langchain_community==0.4.1
+langchain_core==1.1.1
+langchain_milvus==0.3.1
+langchain_openai==1.1.0
+langchain_qdrant==1.1.0
+langgraph==1.0.4
+openai==2.9.0
+pydantic==2.12.5
+pymilvus==2.6.5
+python-dotenv==1.2.1
+PyYAML==6.0.3
+qdrant_client==1.16.1
+requests==2.32.5

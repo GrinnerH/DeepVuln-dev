@@ -1,0 +1,32 @@
+[
+  {
+    "project_name": "GPAC",
+    "cve_id": "CVE-2024-22749",
+    "cwe_id": "CWE-120",
+    "repo_url": "https://github.com/gpac/gpac.git",
+    "vuln_commit_sha": "8684dfb",
+    "fix_commit_sha": "012cd79",
+    "patch_url": "https://github.com/gpac/gpac/commit/7aef8038c6bdd310e65000704e39afaa0e721048",
+    "build_command": "./configure && make",
+    "vulnerable_file": "isomedia/isom_write.c",
+    "target_function": "gf_isom_new_generic_sample_description",
+    "description": "Buffer overflow in GPAC v2.3 in gf_isom_new_generic_sample_description when copying compressor_name into a fixed-size buffer without adequate bounds checking."
+  },
+  {
+    "project_name": "LibTIFF",
+    "cve_id": "CVE-2022-3627",
+    "cwe_id": "CWE-787",
+    "repo_url": "https://gitlab.com/libtiff/libtiff",
+    "vuln_commit_sha": "",
+    "fix_commit_sha": "236b7191f04c60d09ee836ae13b50f812c841047",
+    "patch_url": "https://gitlab.com/libtiff/libtiff/-/commit/236b7191f04c60d09ee836ae13b50f812c841047",
+    "build_command": "cmake -S . -B build && cmake --build build",
+    "vulnerable_file": "tools/tiffcrop.c",
+    "target_function": "extractImageSection",
+    "description": "Out-of-bounds write in tiffcrop's extractImageSection in LibTIFF, fixed by adding bounds checks before copying image sections.",
+    "notes": {
+      "vendor_advisory_ref": "SUSE CVE page",
+      "fix_mentions": "Adds check to avoid writing past buffer in extractImageSection."
+    }
+  }
+]
