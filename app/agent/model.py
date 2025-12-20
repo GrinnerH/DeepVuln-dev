@@ -136,3 +136,15 @@ def build_runnable(
         )
 
     return model
+
+
+def build_chat_model(
+    model_name: Optional[str] = None,
+    tools: Optional[Iterable[BaseTool]] = None,
+    structured_schema: Optional[Type] = None,
+) -> Runnable:
+    """
+    Backward-compatible alias for older node code.
+    model_name is accepted for compatibility; actual selection is via env OPENAI_MODEL.
+    """
+    return build_runnable(tools=tools, structured_schema=structured_schema)

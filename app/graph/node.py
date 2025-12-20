@@ -148,73 +148,42 @@ def setup_environment(state: DeepVulnState) -> Dict[str, Any]:
 
 
 def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
+    """Normalize seed cases.
+
+    Step A (seed provisioning) is automated:
+      - clone / checkout vuln commit
+      - create CodeQL database
+      - locate vulnerable line for prompt snippeting
+
+    This node keeps orchestration logic minimal and delegates robustness to
+    `app.utils.seed_bootstrap` + `app.mcp.codeql_mcp`.
     """
-    Load and normalize seed cases into DeepVulnState.seed_cases.
+    from app.utils.seed_bootstrap import bootstrap_seed_case, load_seed_cases
 
-    V1 philosophy:
-    - Do NOT auto-clone or auto-create CodeQL DB here (to keep ingestion deterministic).
-    - Do validate existence and fail fast with actionable errors.
-    """
-    workspace_dir = state.get("workspace_dir")
-    if not workspace_dir:
-        raise RuntimeError("workspace_dir is missing. Ensure setup_environment sets it.")
+    workspace_dir = state.get("workspace_dir") or "./artifacts/run"
+    Path(workspace_dir).mkdir(parents=True, exist_ok=True)
 
-    try:
-        seed_cases: List[Dict[str, Any]] = load_and_normalize_seeds(workspace_dir)
-    except SeedMaterialError as e:
-        logger.exception("Seed material load failed")
-        return {
-            "error_log": [f"[ingest_seed_material] {e}"],
-        }
+    seeds_in_state = state.get("seed_cases") or []
+    seeds = seeds_in_state if seeds_in_state else load_seed_cases()
+    if not seeds:
+        return {"error_log": ["No seed cases found (state.seed_cases empty and seeds/seed_cases.json not found)."]}
 
+    codeql = CodeQLMCPClient()
+    enriched: List[Dict[str, Any]] = []
     errors: List[str] = []
-    for s in seed_cases:
-        repo_path = Path(s["repo_path"])
-        db_path = Path(s["db_path"])
+    for seed in seeds:
+        try:
+            enriched_seed = bootstrap_seed_case(seed, workspace_dir=workspace_dir, codeql=codeql, overwrite_db=False)
+            enriched.append(_normalize_seed_case(enriched_seed))
+        except Exception as exc:
+            msg = f"Seed bootstrap failed for {seed.get('cve_id') or seed.get('project_name')}: {exc}"
+            logger.exception(msg)
+            errors.append(msg)
+            enriched.append(_normalize_seed_case(seed))
 
-        if not repo_path.exists():
-            errors.append(
-                f"[seed:{s['cve_id']}] repo_path not found: {repo_path}. "
-                f"Please clone {s['repo_url']} into that path, or add repo_path to seed_cases.json."
-            )
-        else:
-            vuln_file = repo_path / s["vulnerable_file"]
-            if not vuln_file.exists():
-                errors.append(
-                    f"[seed:{s['cve_id']}] vulnerable_file not found: {vuln_file}. "
-                    f"Check vulnerable_file path in seed_cases.json."
-                )
-
-        if not db_path.exists():
-            # V1: allow missing DB, but make it explicit (diagnose/evaluate will SKIP analyze)
-            errors.append(
-                f"[seed:{s['cve_id']}] codeql db_path not found: {db_path}. "
-                f"V1 will not auto-create DB. Create it before running baseline/regression analyze."
-            )
-
-        # Baseline query/suite is optional but recommended
-        if not s.get("baseline_query_path"):
-            errors.append(
-                f"[seed:{s['cve_id']}] baseline_query_path is not set. "
-                f"Set env BASELINE_QUERY_PATH or create queries/baseline.qls."
-            )
-        else:
-            q = Path(s["baseline_query_path"])
-            if not q.exists():
-                errors.append(
-                    f"[seed:{s['cve_id']}] baseline_query_path does not exist: {q}. "
-                    f"Fix BASELINE_QUERY_PATH or queries/baseline.qls."
-                )
-
-    update: Dict[str, Any] = {
-        "seed_cases": seed_cases,
-    }
-
+    update: Dict[str, Any] = {"seed_cases": enriched}
     if errors:
-        # append to error_log (ensure reducer/append semantics in your state if desired)
-        update["error_log"] = [f"[ingest_seed_material] {msg}" for msg in errors]
-
-    logger.info("Loaded %d seed case(s).", len(seed_cases))
+        update["error_log"] = (state.get("error_log") or []) + errors
     return update
 
 

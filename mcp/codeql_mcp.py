@@ -2,16 +2,20 @@ from __future__ import annotations
 
 """Lightweight CodeQL "MCP" client.
 
-This is intentionally *not* a full MCP/LangChain integration yet. It is a
-minimal, controllable facade around the CodeQL CLI so the project can be made
-end-to-end functional quickly.
+This module is intentionally *not* a full MCP/LangChain integration yet.
+It provides a minimal, controllable facade around the CodeQL CLI.
 
-Later you can replace this module with a real MCP transport (e.g., RAGFlow MCP
-for docs + a CodeQL MCP server for CLI actions) without rewriting the LangGraph
-nodes.
+Design goals:
+  - Single entry-point for all CodeQL CLI interactions.
+  - Structured return objects for auditability (stdout/stderr/cmd).
+  - "Good enough" robustness for real-world C/C++ builds (Step A automation).
+
+Later you can replace this module with a real MCP transport (e.g., a dedicated
+CodeQL MCP server) without rewriting the LangGraph nodes.
 """
 
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +27,7 @@ class CodeQLExecutionError(RuntimeError):
 
 
 class CodeQLMCPError(RuntimeError):
-    pass
+    """Raised when a CodeQL CLI interaction fails for non-CLI reasons."""
 
 
 def _resolve_codeql_executable() -> Optional[str]:
@@ -33,6 +37,7 @@ def _resolve_codeql_executable() -> Optional[str]:
       1) CODEQL_CLI_PATH env var (directory containing codeql)
       2) PATH lookup
     """
+
     cli_dir = os.getenv("CODEQL_CLI_PATH", "").strip()
     if cli_dir:
         candidate = Path(cli_dir) / "codeql"
@@ -41,14 +46,35 @@ def _resolve_codeql_executable() -> Optional[str]:
         if candidate.exists():
             return str(candidate)
 
-    # Fallback to PATH
     from shutil import which
 
     return which("codeql")
 
 
-def _run(cmd: List[str], cwd: Optional[str] = None, timeout_s: int = 60 * 30) -> Dict[str, Any]:
+def _default_env() -> Dict[str, str]:
+    """Return an environment suited for CodeQL executions.
+
+    Notes:
+      - CodeQL uses CODEQL_JAVA_HOME if set.
+      - Some large DB builds need higher memory; leave to user's environment.
+    """
+
+    env = dict(os.environ)
+    # Ensure deterministic encoding handling across platforms.
+    env.setdefault("LC_ALL", "C")
+    env.setdefault("LANG", "C")
+    return env
+
+
+def _run(
+    cmd: List[str],
+    *,
+    cwd: Optional[str] = None,
+    timeout_s: int = 60 * 60,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Run a subprocess, capturing stdout/stderr for auditing."""
+
     try:
         proc = subprocess.run(
             cmd,
@@ -58,6 +84,7 @@ def _run(cmd: List[str], cwd: Optional[str] = None, timeout_s: int = 60 * 30) ->
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout_s,
+            env=env or _default_env(),
         )
     except subprocess.TimeoutExpired as e:
         raise CodeQLMCPError(f"CodeQL command timed out: {cmd}") from e
@@ -68,6 +95,12 @@ def _run(cmd: List[str], cwd: Optional[str] = None, timeout_s: int = 60 * 30) ->
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
+
+
+def _ensure_dir(path: str) -> str:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return str(p)
 
 
 @dataclass
@@ -88,7 +121,114 @@ class CodeQLMCPClient:
     def available(self) -> bool:
         return bool(self.codeql_path)
 
-    # --- Public API ---
+    # ---------------------------------------------------------------------
+    # Database lifecycle (migrated from legacy tools/codeql.py for robustness)
+    # ---------------------------------------------------------------------
+
+    def create_database(
+        self,
+        *,
+        source_root: str,
+        db_path: str,
+        language: str = "cpp",
+        command: Optional[str] = None,
+        overwrite: bool = False,
+        threads: Optional[int] = None,
+        ram_mb: Optional[int] = None,
+        extra_args: Optional[List[str]] = None,
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run `codeql database create`.
+
+        This absorbs the "good enough" build-handling logic from the legacy
+        implementation (overwrite, threads, env, and optional build command).
+        """
+
+        db_dir = Path(db_path)
+        if db_dir.exists() and overwrite:
+            # Danger: remove existing db dir.
+            import shutil
+
+            shutil.rmtree(db_dir)
+
+        _ensure_dir(str(db_dir.parent))
+
+        if not self.available:
+            return {
+                "ok": False,
+                "returncode": 127,
+                "stderr": "codeql executable not found (set CODEQL_CLI_PATH)",
+                "stdout": "",
+                "cmd": [],
+                "db_path": str(db_dir),
+            }
+
+        cmd_list: List[str] = [
+            self.codeql_path,  # type: ignore[list-item]
+            "database",
+            "create",
+            str(db_dir),
+            f"--language={language}",
+            f"--source-root={str(Path(source_root))}",
+        ]
+
+        if overwrite:
+            cmd_list.append("--overwrite")
+        if threads:
+            cmd_list.append(f"--threads={threads}")
+        if ram_mb:
+            cmd_list.append(f"--ram={ram_mb}")
+        if command:
+            # Use a shell command string; CodeQL accepts it directly.
+            cmd_list.append(f"--command={command}")
+        if extra_args:
+            cmd_list.extend(extra_args)
+
+        result = _run(cmd_list, cwd=cwd)
+        result.update({"ok": result["returncode"] == 0, "db_path": str(db_dir)})
+        return result
+
+    def finalize_database(
+        self,
+        *,
+        db_path: str,
+        finalize_dataset: bool = True,
+        extra_args: Optional[List[str]] = None,
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run `codeql database finalize`.
+
+        Useful after DB creation in some environments to ensure dataset
+        completeness.
+        """
+
+        if not self.available:
+            return {
+                "ok": False,
+                "returncode": 127,
+                "stderr": "codeql executable not found (set CODEQL_CLI_PATH)",
+                "stdout": "",
+                "cmd": [],
+            }
+
+        cmd_list: List[str] = [
+            self.codeql_path,  # type: ignore[list-item]
+            "database",
+            "finalize",
+            str(db_path),
+        ]
+        if finalize_dataset:
+            cmd_list.append("--finalize-dataset")
+        if extra_args:
+            cmd_list.extend(extra_args)
+
+        result = _run(cmd_list, cwd=cwd)
+        result.update({"ok": result["returncode"] == 0})
+        return result
+
+    # -------------------------
+    # Query/analyze operations
+    # -------------------------
 
     def analyze_database(
         self,
@@ -99,11 +239,10 @@ class CodeQLMCPClient:
         additional_search_paths: Optional[List[str]] = None,
         extra_args: Optional[List[str]] = None,
         cwd: Optional[str] = None,
+        timeout_s: int = 60 * 60,
     ) -> Dict[str, Any]:
-        """Run `codeql database analyze`.
+        """Run `codeql database analyze`."""
 
-        If CodeQL is unavailable, returns a stub response with returncode=127.
-        """
         output = Path(output_sarif_path)
         output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -118,7 +257,7 @@ class CodeQLMCPClient:
             }
 
         cmd: List[str] = [
-            self.codeql_path,  # type: ignore[arg-type]
+            self.codeql_path,  # type: ignore[list-item]
             "database",
             "analyze",
             str(db_path),
@@ -132,7 +271,7 @@ class CodeQLMCPClient:
         if extra_args:
             cmd.extend(extra_args)
 
-        result = _run(cmd, cwd=cwd)
+        result = _run(cmd, cwd=cwd, timeout_s=timeout_s)
         result.update({"ok": result["returncode"] == 0, "output_sarif_path": str(output)})
         return result
 
@@ -144,7 +283,8 @@ class CodeQLMCPClient:
         extra_args: Optional[List[str]] = None,
         cwd: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run `codeql query compile` for a single .ql file."""
+        """Run `codeql query compile` for a single .ql/.qll file."""
+
         if not self.available:
             return {
                 "ok": False,
@@ -154,7 +294,12 @@ class CodeQLMCPClient:
                 "cmd": [],
             }
 
-        cmd: List[str] = [self.codeql_path, "query", "compile", str(query_path)]  # type: ignore[list-item]
+        cmd: List[str] = [
+            self.codeql_path,  # type: ignore[list-item]
+            "query",
+            "compile",
+            str(query_path),
+        ]
         if additional_search_paths:
             for p in additional_search_paths:
                 cmd.append(f"--search-path={p}")
