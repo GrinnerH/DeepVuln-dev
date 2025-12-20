@@ -22,6 +22,7 @@ from utils.seed_loader import (
     normalize_seed_case,
     save_seed_cases,
 )
+
 logger = logging.getLogger("deepvuln.v2")
 
 
@@ -34,15 +35,49 @@ def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def _read_source_window(repo_path: str, rel_file: str, line: int, window: int = 80) -> str:
-    """Read a window of source lines around a 1-indexed line."""
-    file_path = Path(repo_path) / rel_file
-    if not file_path.exists():
-        return f"[source-unavailable] File not found: {file_path}"
+def _init_file_logger(*, logs_dir: Path, run_id: Optional[str] = None) -> None:
+    """Attach a file handler to the module logger.
+
+    This keeps execution traces out of the LangGraph state, while still
+    providing a durable, per-run audit trail on disk.
+
+    The handler is added idempotently (safe across retries / re-entry).
+    """
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    rid = run_id or "run"
+    log_path = logs_dir / f"{rid}.trace.log"
+
+    # Avoid duplicate handlers (important in notebook/retry contexts).
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler):
+            try:
+                if Path(getattr(h, "baseFilename", "")) == log_path:
+                    return
+            except Exception:
+                continue
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    # Do not force global basicConfig; keep integration-friendly.
+    logger.setLevel(logging.INFO)
+
+
+def _read_code_window(file_path: Path, line: int, window: int = 25) -> str:
+    """
+    Returns a formatted code window around `line` with line numbers.
+    Falls back gracefully if file is missing/unreadable.
+    """
     try:
-        lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        content = safe_read_text(str(file_path))
     except Exception as e:
         return f"[source-unavailable] Failed to read {file_path}: {e}"
+
+    lines = content.splitlines()
+    if not lines:
+        return f"[source-empty] {file_path}"
 
     # convert to 0-indexed indices
     idx = max(0, line - 1)
@@ -57,69 +92,41 @@ def _read_source_window(repo_path: str, rel_file: str, line: int, window: int = 
     return "\n".join(out)
 
 
-def _sarif_has_hit_near_location(
-    sarif_path: str, repo_path: str, rel_file: str, vuln_line: int, tolerance: int = 3
-) -> bool:
-    """Best-effort hit check: any SARIF result location within +/-tolerance lines."""
-    try:
-        data = json.loads(Path(sarif_path).read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return False
-    runs = data.get("runs") or []
-    target_path = str(Path(repo_path) / rel_file)
-    target_path_norm = os.path.normpath(target_path)
-
-    for run in runs:
-        results = run.get("results") or []
-        for r in results:
-            locs = (r.get("locations") or [])
-            for loc in locs:
-                ploc = (loc.get("physicalLocation") or {})
-                artifact = (ploc.get("artifactLocation") or {})
-                uri = artifact.get("uri") or ""
-                region = (ploc.get("region") or {})
-                start_line = region.get("startLine")
-                if start_line is None:
-                    continue
-
-                # resolve SARIF uri to an absolute-ish path if possible.
-                if uri.startswith("file:"):
-                    uri_path = uri.replace("file:", "")
-                else:
-                    uri_path = uri
-                uri_path_norm = os.path.normpath(os.path.join(repo_path, uri_path))
-
-                # Compare normalized paths.
-                if uri_path_norm != target_path_norm:
-                    continue
-                try:
-                    if abs(int(start_line) - int(vuln_line)) <= tolerance:
-                        return True
-                except Exception:
-                    continue
-    return False
+def _sanitize_filename(s: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "_", s.strip())
+    return s[:180] if len(s) > 180 else s
 
 
 # -----------------------------
-# Non-loop nodes (stubs remain lightweight)
+# Stage A: setup + ingest
 # -----------------------------
 
 
 def setup_environment(state: DeepVulnState) -> Dict[str, Any]:
-    """Create run workspace directories and initialize control fields."""
+    """Create run workspace directories and initialize control fields.
+
+    Notes:
+      - This node returns only minimal, serializable fields for state updates.
+      - Runtime logs are written to a local trace file (not stored in state).
+    """
     workspace = Path(state.get("workspace_dir") or "./artifacts/run")
     _ensure_dir(workspace)
     _ensure_dir(workspace / "baseline")
     _ensure_dir(workspace / "semantic_packs")
     _ensure_dir(workspace / "reports")
-    _ensure_dir(workspace / "logs")
+    logs_dir = workspace / "logs"
+    _ensure_dir(logs_dir)
+
+    # Initialize a per-run file logger (idempotent).
+    _init_file_logger(logs_dir=logs_dir, run_id=state.get("run_id"))
+
+    logger.info("Workspace initialized at %s", workspace)
 
     return {
         "workspace_dir": str(workspace),
         "iteration_count": state.get("iteration_count", 0),
         "max_iterations": state.get("max_iterations", 3),
         "is_converged": False,
-        "error_log": state.get("error_log", []),
     }
 
 
@@ -130,8 +137,9 @@ def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
     Priority:
       1) seeds/seed_assets.json (preferred, produced by scripts/bootstrap_seed_assets.py)
       2) seeds/seed_cases.json + bootstrap (dev fallback) -> also writes seed_assets.json
-    """
 
+    Note: No verbose logs are stored in state; use local trace file + on-disk artifacts.
+    """
     workspace_dir = state.get("workspace_dir") or "./artifacts/run"
     Path(workspace_dir).mkdir(parents=True, exist_ok=True)
 
@@ -144,10 +152,8 @@ def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
     if seed_assets_path.exists():
         raw = load_seed_cases(str(seed_assets_path))
         normalized = [normalize_seed_case(workspace_dir, s) for s in raw]
-        return {
-            "seed_cases": normalized,
-            "logs": state.get("logs", []) + [f"[ingest] loaded manifest: {seed_assets_path} ({len(normalized)} seeds)"],
-        }
+        logger.info("Loaded seed manifest: %s (n=%d)", seed_assets_path, len(normalized))
+        return {"seed_cases": normalized}
 
     # 2) Dev fallback: bootstrap then persist manifest
     raw = load_seed_cases(str(seed_cases_path))
@@ -164,19 +170,19 @@ def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
 
     save_seed_cases(str(seed_assets_path), enriched)
     normalized = [normalize_seed_case(workspace_dir, s) for s in enriched]
-
-    return {
-        "seed_cases": normalized,
-        "logs": state.get("logs", []) + [
-            f"[ingest] bootstrapped from {seed_cases_path} and wrote manifest: {seed_assets_path} ({len(normalized)} seeds)"
-        ],
-    }
-
+    logger.info(
+        "Bootstrapped from %s and wrote seed manifest: %s (n=%d)",
+        seed_cases_path,
+        seed_assets_path,
+        len(normalized),
+    )
+    return {"seed_cases": normalized}
 
 
 # -----------------------------
 # Stage B loop: diagnose -> synthesize -> evaluate
 # -----------------------------
+
 
 def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
     workspace_dir = Path(state["workspace_dir"])
@@ -207,6 +213,15 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
     baseline_query_path = seed0.get("baseline_query_path") or os.getenv("BASELINE_QUERY_PATH", "")
     codeql_search_paths = seed0.get("codeql_search_paths") or []
 
+    logger.info(
+        "[diagnose] cve=%s repo=%s db=%s vuln_file=%s vuln_line=%s",
+        cve_id,
+        repo_path,
+        db_path,
+        vuln_file_rel,
+        vuln_line,
+    )
+
     diagnostics_dir = ensure_dir(workspace_dir / "diagnostics")
     evidence_dir = ensure_dir(workspace_dir / "evidence")
 
@@ -218,10 +233,7 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
     baseline_summary = "NOT_RUN"
 
     try:
-        codeql = state.get("codeql_client")
-        if codeql is None:
-            from app.mcp.codeql_mcp import CodeQLMCPClient  # adjust to your actual module path
-            codeql = CodeQLMCPClient()
+        codeql = CodeQLMCPClient()
 
         if baseline_query_path and db_path:
             baseline_result = codeql.analyze_database(
@@ -240,137 +252,79 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
         baseline_summary = f"ERROR: {e}"
         baseline_result = {"ok": False, "error": str(e)}
 
-    baseline_log_path.write_text(
-        json.dumps(
+    baseline_log_path.write_text(json.dumps(baseline_result, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[diagnose] baseline_summary=%s baseline_log=%s", baseline_summary, baseline_log_path)
+
+    evidence_refs: List[EvidenceRef] = []
+    evidence_refs.append(
+        {
+            "kind": "diagnostic_log",
+            "path": str(baseline_log_path),
+            "note": f"Baseline CodeQL analyze result: {baseline_summary}",
+        }
+    )
+    if baseline_sarif_path.exists():
+        evidence_refs.append(
             {
-                "cve_id": cve_id,
-                "db_path": db_path,
-                "baseline_query_path": baseline_query_path,
-                "baseline_summary": baseline_summary,
-                "baseline_result": baseline_result,
-                "baseline_sarif_path": str(baseline_sarif_path),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+                "kind": "sarif",
+                "path": str(baseline_sarif_path),
+                "note": "Baseline SARIF output (may be empty if no alerts).",
+            }
+        )
 
-    # ---- 2) Read code slice around vuln line ----
-    code_slice_path = evidence_dir / f"{cve_id}_code_slice.txt"
-    file_abs_path = (repo_path / vuln_file_rel).resolve() if repo_path and vuln_file_rel else None
+    # ---- 2) Vulnerable code window evidence ----
+    abs_vuln_file = repo_path / vuln_file_rel
+    code_snip = _read_code_window(abs_vuln_file, line=vuln_line, window=25)
+    snippet_path = evidence_dir / f"{cve_id}_{_sanitize_filename(vuln_file_rel)}_L{vuln_line}.code.txt"
+    snippet_path.write_text(code_snip, encoding="utf-8")
 
-    if file_abs_path and file_abs_path.exists():
-        src_text = safe_read_text(file_abs_path)
-        window_info = extract_code_window(src_text, vuln_line, window=30)
-    else:
-        window_info = {
-            "start_line": 1,
-            "end_line": 1,
-            "snippet": f"<<MISSING_FILE repo_path={repo_path} vuln_file={vuln_file_rel}>>",
+    evidence_refs.append(
+        {
+            "kind": "code_snippet",
+            "path": str(snippet_path),
+            "note": "Code window around vulnerable location.",
         }
-
-    code_slice_path.write_text(
-        f"# file: {vuln_file_rel}\n# abs: {file_abs_path}\n# focus_line: {vuln_line}\n\n{window_info['snippet']}\n",
-        encoding="utf-8",
     )
 
-    # ---- 3) Failure-driven prompt ----
-    prompt = f"""
-You are a security researcher specializing in CodeQL-based vulnerability analysis and semantic gap diagnosis.
-
-We follow a failure-driven workflow:
-- Run baseline CodeQL on a known vulnerable seed.
-- Diagnose which missing semantic knowledge caused the failure (or weak proof).
-- Produce a falsifiable hypothesis and a minimal semantic-pack plan.
-
-Seed case:
-- CVE: {cve_id}
-- Repo path (local): {str(repo_path)}
-- Vulnerable file: {vuln_file_rel}
-- Vulnerable line: {vuln_line}
-
-Baseline CodeQL run summary:
-- Status: {baseline_summary}
-- codeql stderr (truncated):
-{(baseline_result.get("stderr") or "")[:2000]}
-- SARIF path (if produced): {str(baseline_sarif_path)}
-
-Vulnerable code slice ('>>' marks focal line):
-{window_info["snippet"]}
-
-Your task:
-1) Choose exactly ONE gap_kind from:
-   - "unknown"
-   - "sink_semantics_missing"
-   - "capacity_semantics_missing"
-   - "length_semantics_missing"
-   - "guard_semantics_missing"
-   - "logic_mismatch"
-
-2) Provide a falsifiable hypothesis:
-   - Must reference concrete program elements visible in the slice (identifiers, fields, functions, macros).
-   - Must explain why baseline CodeQL cannot prove overflow without additional semantics.
-
-3) Provide a minimal modeling_plan (2-5 items):
-   - Each item should describe an implementable semantic hook in a ProjectSemantics.qll pack
-   - Examples: model wrapper as sink, infer capacity from macro/field, treat field as taint source, etc.
-
-4) List additional evidence artifacts that would strengthen the diagnosis (do NOT invent CodeQL APIs).
-   - If you need CodeQL docs, request them explicitly by symbol/topic.
-
-Output STRICT JSON only (no markdown):
-{{
-  "gap_kind": "...",
-  "hypothesis": "...",
-  "modeling_plan": ["...", "..."],
-  "supporting_evidence": [
-    {{"kind": "ast_slice|cfg_slice|sarif|diagnostic_log|other", "note": "what to capture next"}}
-  ],
-  "docs_needed": ["<exact CodeQL symbol/topic to look up>"]
-}}
-
-Constraints:
-- Do NOT invent CodeQL APIs/predicates. If uncertain, put it in docs_needed.
-""".strip()
-
-    model = build_chat_model(
-        model_name=os.getenv("OPENAI_MODEL", "deepseek-chat"),
-        tools=[],               # later bind RAGFlow MCP tools optionally
-        structured_schema=None  # later switch to with_structured_output
+    # ---- 3) LLM: failure-driven diagnosis ----
+    # Prompt constraints: LLM suggests semantics; CodeQL remains the final verifier.
+    prompt = _DIAGNOSE_PROMPT_TEMPLATE.format(
+        cve_id=cve_id,
+        baseline_summary=baseline_summary,
+        baseline_log_path=str(baseline_log_path),
+        baseline_sarif_path=str(baseline_sarif_path),
+        vulnerable_file=vuln_file_rel,
+        vulnerable_line=vuln_line,
+        code_window=code_snip,
+        target_function=seed0.get("target_function") or "",
     )
 
-    resp = model.invoke(
-        [
-            SystemMessage(content="Return JSON only; no markdown; no extra text."),
-            HumanMessage(content=prompt),
-        ]
-    )
-    llm_text = getattr(resp, "content", None) or str(resp)
-    parsed = json_loads_best_effort(llm_text) or {}
+    runnable = build_chat_model(structured_schema=None)
+    messages = [
+        SystemMessage(content="You are a security analysis assistant specializing in CodeQL semantic modeling."),
+        HumanMessage(content=prompt),
+    ]
 
-    if not parsed:
-        parsed = {
-            "gap_kind": "unknown",
-            "hypothesis": "LLM output was not parseable as JSON.",
-            "modeling_plan": [],
-            "supporting_evidence": [],
-            "docs_needed": [],
-        }
+    raw = runnable.invoke(messages)
+    raw_text = getattr(raw, "content", raw)
 
-    diagnosis = {
-        "gap_kind": parsed.get("gap_kind", "unknown"),
-        "hypothesis": parsed.get("hypothesis", ""),
-        "supporting_evidence_refs": [
-            {"kind": "diagnostic_log", "path": str(baseline_log_path), "note": "baseline run result"},
-            {"kind": "sarif", "path": str(baseline_sarif_path), "note": "baseline SARIF output"},
-            {"kind": "other", "path": str(code_slice_path), "note": "code slice around vulnerable line"},
-        ],
-        "docs_citation_refs": ensure_list(parsed.get("docs_needed")),
-        "modeling_plan": ensure_list(parsed.get("modeling_plan")),
-        "supporting_evidence": ensure_list(parsed.get("supporting_evidence")),
+    parsed = json_loads_best_effort(raw_text, fallback={})
+    gap_kind = parsed.get("gap_kind", "unknown")
+    hypothesis = parsed.get("hypothesis", "")
+    modeling_plan = ensure_list(parsed.get("modeling_plan", []))
+    docs_needed = ensure_list(parsed.get("docs_needed", []))
+    supporting_evidence = ensure_list(parsed.get("supporting_evidence", []))
+
+    diagnosis: GapDiagnosis = {
+        "gap_kind": gap_kind,
+        "hypothesis": hypothesis,
+        "supporting_evidence_refs": evidence_refs,
+        "docs_citation_refs": docs_needed,
+        "modeling_plan": modeling_plan,
+        "supporting_evidence": supporting_evidence,
     }
 
+    logger.info("[diagnose] gap_kind=%s modeling_plan_items=%d", gap_kind, len(modeling_plan))
     return {"active_diagnosis": diagnosis}
 
 
@@ -379,7 +333,10 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     ensure_dir(workspace_dir)
 
     seed_cases = state.get("seed_cases", [])
-    seed0 = seed_cases[0] if seed_cases else {}
+    if not seed_cases:
+        return {"active_semantic_artifact": {"semantic_pack_path": ""}}
+
+    seed0 = seed_cases[0]
     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
 
     diagnosis = state.get("active_diagnosis") or {}
@@ -387,74 +344,33 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     hypothesis = diagnosis.get("hypothesis", "")
     modeling_plan = diagnosis.get("modeling_plan", [])
 
-    it_next = int(state.get("iteration_count", 0) or 0) + 1
-    pack_dir = ensure_dir(workspace_dir / "semantic_packs" / f"iter_{it_next:02d}")
-    out_qll_path = pack_dir / "ProjectSemantics.qll"
+    iter_idx = int(state.get("iteration_count", 0)) + 1
+    pack_dir = ensure_dir(workspace_dir / "semantic_packs" / f"iter_{iter_idx:02d}")
+    qll_path = pack_dir / "ProjectSemantics.qll"
 
-    prompt = f"""
-You are an expert CodeQL engineer for C/C++ security queries.
-
-Goal:
-Generate a single CodeQL QLL file named "ProjectSemantics.qll" that fills a semantic gap revealed by a failure-driven diagnosis.
-
-Seed CVE: {cve_id}
-
-Diagnosis:
-- gap_kind: {gap_kind}
-- hypothesis: {hypothesis}
-
-Modeling plan:
-{modeling_plan}
-
-Output requirements:
-1) Output ONLY raw QLL content (no markdown / fences).
-2) Must be syntactically valid CodeQL and start with `import cpp` if needed.
-3) Keep the semantic pack minimal and focused.
-4) Prefer structural modeling over fragile string matching.
-5) Include a short header comment explaining:
-   - what gap it addresses
-   - what hooks it adds
-   - assumptions/limits
-
-Strict constraint:
-- Do NOT invent CodeQL APIs/predicates. If unsure, insert TODO comments and rely on docs later.
-
-Deliver exactly the QLL file content.
-""".strip()
-
-    model = build_chat_model(
-        model_name=os.getenv("OPENAI_MODEL", "deepseek-chat"),
-        tools=[],               # later bind RAGFlow MCP optionally
-        structured_schema=None
+    prompt = _SYNTHESIZE_PROMPT_TEMPLATE.format(
+        cve_id=cve_id,
+        gap_kind=gap_kind,
+        hypothesis=hypothesis,
+        modeling_plan="\n".join([f"- {x}" for x in modeling_plan]) if modeling_plan else "(none)",
     )
 
-    resp = model.invoke(
-        [
-            SystemMessage(content="Return only valid QLL file content. No markdown."),
-            HumanMessage(content=prompt),
-        ]
-    )
-    qll_text = (getattr(resp, "content", None) or str(resp)).strip()
+    runnable = build_chat_model(structured_schema=None)
+    messages = [
+        SystemMessage(content="You generate safe, minimal CodeQL semantic packs for C/C++ projects."),
+        HumanMessage(content=prompt),
+    ]
+    raw = runnable.invoke(messages)
+    raw_text = getattr(raw, "content", raw)
 
-    if not qll_text:
-        qll_text = (
-            "/**\n"
-            " * Auto-generated ProjectSemantics.qll (EMPTY FALLBACK)\n"
-            " * NOTE: LLM returned empty output.\n"
-            " */\n"
-            "import cpp\n\n"
-            "// TODO: implement semantic hooks\n"
-        )
-
-    out_qll_path.write_text(qll_text + "\n", encoding="utf-8")
+    # The LLM should output CodeQL (.qll) content.
+    qll_path.write_text(str(raw_text), encoding="utf-8")
+    logger.info("[synthesize] wrote semantic pack: %s", qll_path)
 
     artifact = {
-        "semantic_pack_path": str(out_qll_path),
-        "compile_log_ref": {"kind": "diagnostic_log", "path": "", "note": "filled in evaluate_modeling_success"},
+        "semantic_pack_path": str(qll_path),
     }
-
     return {"active_semantic_artifact": artifact}
-
 
 
 def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
@@ -473,7 +389,6 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
     db_path = seed0["db_path"]
     vuln_file_rel = seed0["vulnerable_file"]
     vuln_line = int(seed0.get("vulnerable_line") or 1)
-
     codeql_search_paths = seed0.get("codeql_search_paths") or []
 
     artifact = state.get("active_semantic_artifact") or {}
@@ -483,18 +398,15 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
         return {"active_decision": decision, "is_converged": False}
 
     qll_path_p = Path(qll_path)
+    iter_idx = int(state.get("iteration_count", 0)) + 1
 
     diagnostics_dir = ensure_dir(workspace_dir / "diagnostics")
-    compile_log_path = diagnostics_dir / f"{cve_id}_compile_iter_{int(state.get('iteration_count', 0))+1:02d}.json"
+    compile_log_path = diagnostics_dir / f"{cve_id}_compile_iter_{iter_idx:02d}.json"
+    regression_sarif_path = diagnostics_dir / f"{cve_id}_regression_iter_{iter_idx:02d}.sarif"
+    regression_log_path = diagnostics_dir / f"{cve_id}_regression_iter_{iter_idx:02d}.json"
 
-    regression_sarif_path = diagnostics_dir / f"{cve_id}_regression_iter_{int(state.get('iteration_count', 0))+1:02d}.sarif"
-    regression_log_path = diagnostics_dir / f"{cve_id}_regression_iter_{int(state.get('iteration_count', 0))+1:02d}.json"
-
-    # Get codeql client
-    codeql = state.get("codeql_client")
-    if codeql is None:
-        from app.mcp.codeql_mcp import CodeQLMCPClient  # adjust if needed
-        codeql = CodeQLMCPClient()
+    # Local client (do NOT store in state; keep state serializable)
+    codeql = CodeQLMCPClient()
 
     # ---- 1) Compile the generated semantic pack (query compile) ----
     compile_res = codeql.query_compile(
@@ -506,366 +418,134 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
     compile_log_path.write_text(json.dumps(compile_res, ensure_ascii=False, indent=2), encoding="utf-8")
 
     compile_ok = bool(compile_res.get("ok"))
+    logger.info("[evaluate] compile_ok=%s compile_log=%s", compile_ok, compile_log_path)
 
-    # Update active_semantic_artifact.compile_log_ref
     artifact_updated = dict(artifact)
     artifact_updated["compile_log_ref"] = {
         "kind": "diagnostic_log",
         "path": str(compile_log_path),
-        "note": "codeql query compile log",
+        "note": "CodeQL query compile output for semantic pack.",
     }
 
-    # Early decision if compile fails
-    it_next = int(state.get("iteration_count", 0) or 0) + 1
-    max_iter = int(state.get("max_iterations", 3) or 3)
-
     if not compile_ok:
-        decision = {
-            "outcome": "continue" if it_next < max_iter else "halt",
-            "rationale": "Semantic pack failed to compile; see compile log and refine.",
+        decision: ModelingDecision = {
+            "outcome": "continue",
+            "rationale": "Semantic pack failed to compile; refine semantics and retry.",
         }
         record: ModelingRecord = {
-            "iteration_index": it_next,
-            "diagnosis": state.get("active_diagnosis", {}),
+            "iteration_index": iter_idx,
+            "diagnosis": state.get("active_diagnosis") or {},
             "semantic_artifact": artifact_updated,
             "metrics": {"compile_ok": False, "seed_hit_rate": 0.0},
             "decision": decision,
         }
         return {
             "active_semantic_artifact": artifact_updated,
-            "modeling_history": [record],
-            "iteration_count": it_next,
-            "is_converged": False,
             "active_decision": decision,
+            "modeling_history": [record],
+            "iteration_count": iter_idx,
+            "is_converged": False,
         }
 
-    # ---- 2) Regression analyze on seed db ----
-    # V1: if seed provides regression_query_path use it; else fallback to baseline_query_path; else analyze the qll itself
-    regression_query = (
-        seed0.get("regression_query_path")
-        or seed0.get("baseline_query_path")
-        or str(qll_path_p)
-    )
-
+    # ---- 2) Regression run on the seed DB ----
     regression_res = codeql.analyze_database(
         db_path=str(db_path),
-        query_or_suite_path=str(regression_query),
+        query_or_suite_path=str(qll_path_p),
         output_sarif_path=str(regression_sarif_path),
         additional_search_paths=codeql_search_paths or None,
         extra_args=None,
         cwd=None,
     )
     regression_log_path.write_text(json.dumps(regression_res, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[evaluate] regression_ok=%s sarif=%s", regression_res.get("ok"), regression_sarif_path)
 
-    # ---- 3) Compute hit_rate (V1 proxy oracle) ----
-    locs = _parse_sarif_locations(regression_sarif_path)
-    hit = _hit_vuln_site(locs, vuln_file_rel=vuln_file_rel, vuln_line=vuln_line, radius=8)
-
+    # ---- 3) Compute seed hit rate (proxy oracle) ----
+    locs = _parse_sarif_locations(regression_sarif_path) if regression_sarif_path.exists() else []
+    hit = _hit_vuln_site(locs, vuln_file_rel=vuln_file_rel, vuln_line=vuln_line, radius=3)
     seed_hit_rate = 1.0 if hit else 0.0
 
-    # ---- 4) Convergence decision ----
-    # V1 default: converge if hit_rate == 1.0
-    if seed_hit_rate >= 1.0:
-        decision = {"outcome": "converged", "rationale": "Regression SARIF hits the vulnerable site in seed."}
-        is_converged = True
+    outcome: ModelingDecision["outcome"]
+    if hit:
+        outcome = "converged"
+        rationale = "Regression run produced a SARIF location near the vulnerable site."
         best_pack = str(qll_path_p)
+        is_converged = True
     else:
-        decision = {
-            "outcome": "continue" if it_next < max_iter else "halt",
-            "rationale": "Regression did not hit vulnerable site; refine semantic model.",
-        }
-        is_converged = False
-        best_pack = state.get("best_semantic_pack_path", "")
+        if iter_idx >= int(state.get("max_iterations", 3)):
+            outcome = "halt"
+            rationale = "Max iterations reached without hitting seed site."
+            best_pack = state.get("best_semantic_pack_path", "")
+            is_converged = False
+        else:
+            outcome = "continue"
+            rationale = "No SARIF hit near seed site; refine semantics and retry."
+            best_pack = state.get("best_semantic_pack_path", "")
+            is_converged = False
 
-    record = {
-        "iteration_index": it_next,
-        "diagnosis": state.get("active_diagnosis", {}),
+    decision = {"outcome": outcome, "rationale": rationale}
+
+    record: ModelingRecord = {
+        "iteration_index": iter_idx,
+        "diagnosis": state.get("active_diagnosis") or {},
         "semantic_artifact": artifact_updated,
-        "metrics": {
-            "compile_ok": True,
-            "seed_hit_rate": seed_hit_rate,
-            # V1 placeholders (你后续接入变体对抗性时再补)
-            "lexical_robustness": 0.0,
-            "fp_rate": 0.0,
-        },
+        "metrics": {"compile_ok": True, "seed_hit_rate": seed_hit_rate},
         "decision": decision,
     }
 
-    out: Dict[str, Any] = {
+    updates: Dict[str, Any] = {
         "active_semantic_artifact": artifact_updated,
-        "modeling_history": [record],
-        "iteration_count": it_next,
-        "is_converged": is_converged,
         "active_decision": decision,
+        "modeling_history": [record],
+        "iteration_count": iter_idx,
+        "is_converged": is_converged,
     }
-    if is_converged:
-        out["best_semantic_pack_path"] = best_pack
+    if best_pack:
+        updates["best_semantic_pack_path"] = best_pack
 
-    return out
-# -----------------------------
-# Remaining pipeline nodes (simple stubs)
-# -----------------------------
-
-
-def scan_target_repository(state: DeepVulnState) -> Dict[str, Any]:
-    logger.info("Scanning target repository (stub)...")
-    return {"scanning_result": {"status": "stub"}}
-
-
-def finalize_and_report(state: DeepVulnState) -> Dict[str, Any]:
-    logger.info("Finalizing report (stub)...")
-    return {}
+    return updates
 
 
 # -----------------------------
-# Prompt templates (explicit in-code as requested)
+# Utility: SARIF parsing / hit check
 # -----------------------------
-
-
-_GAP_DIAGNOSIS_SCHEMA_HINT = {
-    "type": "object",
-    "properties": {
-        "gap_kind": {
-            "type": "string",
-            "enum": [
-                "unknown",
-                "sink_semantics_missing",
-                "capacity_semantics_missing",
-                "length_semantics_missing",
-                "guard_semantics_missing",
-                "logic_mismatch",
-            ],
-        },
-        "hypothesis": {"type": "string"},
-        "supporting_evidence_refs": {"type": "array", "items": {"type": "object"}},
-        "docs_citation_refs": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["gap_kind", "hypothesis"],
-}
-
-
-def _build_gap_diagnosis_prompt(
-    target_cwe_id: Optional[str],
-    baseline_outputs: List[Dict[str, Any]],
-    snippet_blocks: List[str],
-    evidence_refs: List[EvidenceRef],
-) -> str:
-    """Failure-driven diagnosis prompt.
-
-    Emphasizes:
-    - Start from baseline failure mode (miss/hit + errors).
-    - Use *structured evidence* (SARIF/log refs), not hallucinated facts.
-    - Produce falsifiable hypothesis that can be tested by changing semantics and re-running.
-    """
-    baseline_digest = json.dumps(
-        [
-            {
-                "seed_index": o.get("seed_index"),
-                "cve_id": o.get("cve_id"),
-                "baseline_ok": o.get("baseline_ok"),
-                "baseline_hit": o.get("baseline_hit"),
-                "baseline_error": o.get("baseline_error"),
-                "sarif_path": o.get("sarif_path"),
-            }
-            for o in baseline_outputs
-        ],
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    evidence_digest = json.dumps(evidence_refs, ensure_ascii=False, indent=2)
-
-    return f"""You are a security analysis assistant helping to *improve a static analysis*.
-
-Task:
-- Diagnose why the *baseline CodeQL analysis* missed (or could not confidently report) the seed vulnerabilities.
-- Produce a *falsifiable* hypothesis about the missing "project semantics".
-
-Context:
-- Target CWE: {target_cwe_id or 'unknown'}
-- We are running a failure-driven loop: baseline -> diagnosis -> semantic patch -> re-run -> measure hit rate.
-- Evidence MUST come from the provided structured references and code snippets.
-- Do NOT invent CodeQL APIs. If you need CodeQL library docs, you MAY request a doc lookup via an MCP RAG tool,
-  but only if necessary. If you did not use docs, return an empty docs_citation_refs.
-
-GapKind taxonomy (choose ONE):
-- sink_semantics_missing: the write function / sink isn't modeled as a write or isn't captured.
-- capacity_semantics_missing: buffer capacity / destination bound isn't modeled or not comparable.
-- length_semantics_missing: length/source bound information isn't modeled (e.g., external string length).
-- guard_semantics_missing: safety checks exist but are not modeled; or guards are missing but need modeling.
-- logic_mismatch: the query's assumptions don't match the project's idioms; needs alternative modeling.
-- unknown: cannot determine from evidence.
-
-Baseline outputs (per seed):
-{baseline_digest}
-
-Structured evidence references (paths only; do not quote content unless you read them):
-{evidence_digest}
-
-Source snippets around the vulnerable locations:
-{chr(10).join(snippet_blocks) if snippet_blocks else '[no snippets available]'}
-
-Output requirements:
-- Return ONLY a single JSON object.
-- Your hypothesis MUST be testable: it should imply what semantics to add in a .qll patch.
-- supporting_evidence_refs should reference some of the given EvidenceRef entries (by repeating them), or add new ones
-  if you created additional logs/snippets.
-
-JSON schema:
-{json.dumps(_GAP_DIAGNOSIS_SCHEMA_HINT, ensure_ascii=False, indent=2)}
-"""
-
-
-_SEMANTIC_SYNTHESIS_SCHEMA_HINT = {
-    "type": "object",
-    "properties": {
-        "semantic_pack_qll": {"type": "string"},
-        "validation_query_ql": {"type": "string"},
-        "notes": {"type": "string"},
-    },
-    "required": ["semantic_pack_qll", "validation_query_ql"],
-}
-
-
-def _build_semantic_synthesis_prompt(
-    target_cwe_id: Optional[str],
-    diagnosis: Dict[str, Any],
-    evidence_refs: List[Dict[str, Any]],
-    docs_refs: List[str],
-) -> str:
-    """Prompt to synthesize a semantic pack (.qll) and a validation query (.ql).
-
-Important: This project is research code; prefer clarity and conservative semantics.
-"""
-    return f"""You are generating a *project-specific semantic model extension* for CodeQL.
-
-Goal:
-- Based on the failure diagnosis, generate:
-  1) ProjectSemantics.qll: a semantic extension (library) with predicates/classes that encode the missing semantics.
-  2) ValidateOnSeeds.ql: a small validation query that imports ProjectSemantics.qll and produces SARIF results.
-
-Constraints:
-- Keep it minimal and readable.
-- Do not assume you can change CodeQL standard library files.
-- If you rely on CodeQL library APIs, ensure you only use well-known stable imports. If uncertain, keep the query
-  self-contained and conservative.
-
-Context:
-- Target CWE: {target_cwe_id or 'unknown'}
-- Diagnosis:
-{json.dumps(diagnosis, ensure_ascii=False, indent=2)}
-
-Evidence references you may use conceptually:
-{json.dumps(evidence_refs, ensure_ascii=False, indent=2)}
-
-Doc citations already collected (may be empty):
-{json.dumps(docs_refs, ensure_ascii=False, indent=2)}
-
-Failure-driven requirement:
-- The generated semantic pack MUST be directly motivated by the diagnosis hypothesis.
-- The validation query MUST be able to "observe" the behavior change on seed cases.
-
-Output format:
-- Return ONLY a JSON object with fields:
-  - semantic_pack_qll (string)
-  - validation_query_ql (string)
-  - notes (string, optional)
-
-JSON schema:
-{json.dumps(_SEMANTIC_SYNTHESIS_SCHEMA_HINT, ensure_ascii=False, indent=2)}
-"""
-
-
-# -----------------------------
-# Conservative defaults (used when no LLM key is available)
-# -----------------------------
-
-
-_DEFAULT_BASELINE_QL = r"""/**
- * @name Baseline: calls to strcpy (very coarse)
- * @kind problem
- * @id deepvuln/baseline-strcpy
- */
-
-import cpp
-
-from FunctionCall call
-where call.getTarget().getName() = "strcpy"
-select call, "Call to strcpy (baseline)."
-"""
-
-
-_DEFAULT_SEMANTIC_PACK_QLL = r"""/**
- * ProjectSemantics.qll (placeholder)
- *
- * This file is intentionally minimal in the skeleton implementation.
- * Replace with your real "semantic pack" modeling hooks.
- */
-
-import cpp
-
-/**
- * Example predicate: treat certain fields as "unconstrained" sources.
- *
- * NOTE: This is a stub. In your real implementation, this predicate should be
- * derived from evidence and optionally backed by doc citations.
- */
-predicate isUnconstrainedStringExpr(Expr e) {
-  exists(FieldAccess fa | e = fa)
-}
-"""
-
-
-_DEFAULT_VALIDATION_QUERY_QL = r"""/**
- * @name Validate seeds: strcpy with likely-unconstrained source
- * @kind problem
- * @id deepvuln/validate-unconstrained-strcpy
- */
-
-import cpp
-import ProjectSemantics
-
-from FunctionCall call
-where
-  call.getTarget().getName() = "strcpy" and
-  isUnconstrainedStringExpr(call.getArgument(1))
-select call, "strcpy where source is considered unconstrained (semantic pack)."
-"""
 
 
 def _parse_sarif_locations(sarif_path: Path) -> List[Dict[str, Any]]:
     """
-    Minimal SARIF parser:
-    Extract (uri, startLine, endLine) from results.
-    This is intentionally conservative for V1.
+    Extract a flat list of locations from SARIF results.
+    Each item: { uri, startLine, endLine, ruleId, message }
     """
-    if not sarif_path.exists():
-        return []
-
     try:
-        data = json.loads(sarif_path.read_text(encoding="utf-8", errors="replace"))
+        sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
     except Exception:
         return []
 
-    locs: List[Dict[str, Any]] = []
-    runs = data.get("runs") or []
+    out: List[Dict[str, Any]] = []
+    runs = sarif.get("runs") or []
     for run in runs:
         results = run.get("results") or []
         for r in results:
-            locations = r.get("locations") or []
-            for loc in locations:
-                phys = (loc.get("physicalLocation") or {})
-                artifact = (phys.get("artifactLocation") or {})
-                region = (phys.get("region") or {})
-                uri = artifact.get("uri")
-                start_line = region.get("startLine")
-                end_line = region.get("endLine", start_line)
-                if uri:
-                    locs.append({"uri": uri, "startLine": start_line, "endLine": end_line})
-    return locs
+            rule_id = r.get("ruleId")
+            msg = (r.get("message") or {}).get("text", "")
+            locs = (r.get("locations") or [])
+            for loc in locs:
+                pl = (loc.get("physicalLocation") or {})
+                art = (pl.get("artifactLocation") or {})
+                reg = (pl.get("region") or {})
+                uri = art.get("uri")
+                out.append(
+                    {
+                        "uri": uri,
+                        "startLine": reg.get("startLine"),
+                        "endLine": reg.get("endLine"),
+                        "ruleId": rule_id,
+                        "message": msg,
+                    }
+                )
+    return out
 
 
-def _hit_vuln_site(locs: List[Dict[str, Any]], vuln_file_rel: str, vuln_line: int, radius: int = 8) -> bool:
+def _hit_vuln_site(locs: List[Dict[str, Any]], vuln_file_rel: str, vuln_line: int, radius: int = 3) -> bool:
     """
     Proxy oracle for V1:
     If any SARIF location matches the vulnerable file and within +/- radius lines, count as hit.
@@ -881,3 +561,93 @@ def _hit_vuln_site(locs: List[Dict[str, Any]], vuln_file_rel: str, vuln_line: in
             if isinstance(sl, int) and abs(sl - vuln_line) <= radius:
                 return True
     return False
+
+
+# -----------------------------
+# Prompts
+# -----------------------------
+
+
+_DIAGNOSE_PROMPT_TEMPLATE = r"""
+You are given a real-world seed vulnerability exemplar.
+
+Your job is NOT to decide the vulnerability, but to diagnose why baseline CodeQL did NOT flag it (or was inconclusive),
+and identify what project-specific semantics are missing.
+
+Constraints:
+- You must be failure-driven: use baseline SARIF/logs and the code window as evidence.
+- You must propose testable hypotheses and a concrete semantic modeling plan.
+- You must NOT invent CodeQL APIs. If you need docs, request them via docs_needed.
+
+Inputs:
+- CVE: {cve_id}
+- Baseline summary: {baseline_summary}
+- Baseline log path: {baseline_log_path}
+- Baseline SARIF path: {baseline_sarif_path}
+
+Vulnerable site anchor:
+- File: {vulnerable_file}
+- Line: {vulnerable_line}
+- Target function: {target_function}
+
+Code window:
+{code_window}
+
+Required output:
+1) Pick one gap_kind from:
+   - unknown
+   - sink_semantics_missing
+   - capacity_semantics_missing
+   - length_semantics_missing
+   - guard_semantics_missing
+   - logic_mismatch
+
+2) Provide a falsifiable hypothesis:
+   - Must reference code details (fields, macros, wrappers, guards).
+   - Must explain why baseline CodeQL cannot prove overflow without additional semantics.
+
+3) Provide a minimal modeling_plan (2-5 items):
+   - Each item should describe an implementable semantic hook in a ProjectSemantics.qll pack
+   - Examples: model wrapper as sink, infer capacity from macro/field, treat field as taint source, etc.
+
+4) List additional evidence artifacts that would strengthen the diagnosis (do NOT invent CodeQL APIs).
+   - If you need CodeQL docs, request them explicitly by symbol/topic.
+
+Output STRICT JSON only (no markdown):
+{{
+  "gap_kind": "...",
+  "hypothesis": "...",
+  "modeling_plan": ["...", "..."],
+  "supporting_evidence": [
+    "..."
+  ],
+  "docs_needed": [
+    "..."
+  ]
+}}
+"""
+
+
+_SYNTHESIZE_PROMPT_TEMPLATE = r"""
+You are generating a minimal, compiling CodeQL semantic pack for a C/C++ project.
+
+Goal:
+- Implement project-specific semantics that close the diagnosed gap.
+- Output must be CodeQL (.qll) ONLY.
+- Keep it minimal and safe: avoid over-approximation that would explode false positives.
+
+Context:
+- CVE: {cve_id}
+- gap_kind: {gap_kind}
+- hypothesis: {hypothesis}
+- modeling_plan:
+{modeling_plan}
+
+Rules:
+- You may import `cpp` and standard CodeQL C++ libraries.
+- You should define predicates / classes that can be used by existing queries.
+- Prefer additive modeling (do not rewrite core libraries).
+- Do NOT output markdown.
+
+Output: CodeQL (.qll) content only.
+"""
