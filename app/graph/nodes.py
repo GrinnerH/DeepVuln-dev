@@ -7,14 +7,21 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.llm.model import build_chat_model
+from app.agent.model import build_chat_model
 from langchain_core.messages import SystemMessage, HumanMessage
 from app.core.state import DeepVulnState, EvidenceRef, GapDiagnosis, ModelingDecision, ModelingRecord
 from app.mcp.codeql_mcp import CodeQLMCPClient, CodeQLExecutionError
-from app.utils.io import ensure_dir, safe_read_text
-from app.utils.code_window import extract_code_window
-from app.utils.jsonx import ensure_list, json_loads_best_effort
-from app.utils.seed_loader import load_and_normalize_seeds, SeedMaterialError
+from utils.io import ensure_dir, safe_read_text
+from utils.code_window import extract_code_window
+from utils.jsonx import ensure_list, json_loads_best_effort
+from utils.seed_loader import (
+    load_and_normalize_seeds,
+    SeedMaterialError,
+    bootstrap_seed_case,
+    load_seed_cases,
+    normalize_seed_case,
+    save_seed_cases,
+)
 logger = logging.getLogger("deepvuln.v2")
 
 
@@ -48,37 +55,6 @@ def _read_source_window(repo_path: str, rel_file: str, line: int, window: int = 
         prefix = ">>" if i == idx else "  "
         out.append(f"{prefix} {i+1:6d}: {lines[i]}")
     return "\n".join(out)
-
-
-def _normalize_seed_case(seed: Dict[str, Any]) -> Dict[str, Any]:
-    """Best-effort normalization to a canonical shape used by nodes."""
-    # Common aliases observed in earlier notes / seeds files.
-    repo_path = seed.get("repo_path") or seed.get("local_repo_path") or seed.get("repo")
-    db_path = seed.get("codeql_db_path") or seed.get("db_path") or seed.get("database")
-    vuln_file = seed.get("vuln_file") or seed.get("vulnerable_file") or seed.get("file")
-    vuln_line = seed.get("vuln_line") or seed.get("line") or seed.get("vulnerable_line")
-
-    # If only absolute file path is provided, try to convert to repo-relative.
-    if vuln_file and repo_path and os.path.isabs(vuln_file):
-        try:
-            vuln_file = str(Path(vuln_file).resolve().relative_to(Path(repo_path).resolve()))
-        except Exception:
-            # keep as-is
-            pass
-
-    out = dict(seed)
-    if repo_path:
-        out["repo_path"] = repo_path
-    if db_path:
-        out["codeql_db_path"] = db_path
-    if vuln_file:
-        out["vuln_file"] = vuln_file
-    if vuln_line is not None:
-        try:
-            out["vuln_line"] = int(vuln_line)
-        except Exception:
-            out["vuln_line"] = vuln_line
-    return out
 
 
 def _sarif_has_hit_near_location(
@@ -148,43 +124,54 @@ def setup_environment(state: DeepVulnState) -> Dict[str, Any]:
 
 
 def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
-    """Normalize seed cases.
-
-    Step A (seed provisioning) is automated:
-      - clone / checkout vuln commit
-      - create CodeQL database
-      - locate vulnerable line for prompt snippeting
-
-    This node keeps orchestration logic minimal and delegates robustness to
-    `app.utils.seed_bootstrap` + `app.mcp.codeql_mcp`.
     """
-    from app.utils.seed_bootstrap import bootstrap_seed_case, load_seed_cases
+    Consume seed manifest produced by Step A.
+
+    Priority:
+      1) seeds/seed_assets.json (preferred, produced by scripts/bootstrap_seed_assets.py)
+      2) seeds/seed_cases.json + bootstrap (dev fallback) -> also writes seed_assets.json
+    """
 
     workspace_dir = state.get("workspace_dir") or "./artifacts/run"
     Path(workspace_dir).mkdir(parents=True, exist_ok=True)
 
-    seeds_in_state = state.get("seed_cases") or []
-    seeds = seeds_in_state if seeds_in_state else load_seed_cases()
-    if not seeds:
-        return {"error_log": ["No seed cases found (state.seed_cases empty and seeds/seed_cases.json not found)."]}
+    seed_assets_path = Path("seeds/seed_assets.json")
+    seed_cases_path = Path("seeds/seed_cases.json")
 
     codeql = CodeQLMCPClient()
-    enriched: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    for seed in seeds:
-        try:
-            enriched_seed = bootstrap_seed_case(seed, workspace_dir=workspace_dir, codeql=codeql, overwrite_db=False)
-            enriched.append(_normalize_seed_case(enriched_seed))
-        except Exception as exc:
-            msg = f"Seed bootstrap failed for {seed.get('cve_id') or seed.get('project_name')}: {exc}"
-            logger.exception(msg)
-            errors.append(msg)
-            enriched.append(_normalize_seed_case(seed))
 
-    update: Dict[str, Any] = {"seed_cases": enriched}
-    if errors:
-        update["error_log"] = (state.get("error_log") or []) + errors
-    return update
+    # 1) Preferred path: consume manifest
+    if seed_assets_path.exists():
+        raw = load_seed_cases(str(seed_assets_path))
+        normalized = [normalize_seed_case(workspace_dir, s) for s in raw]
+        return {
+            "seed_cases": normalized,
+            "logs": state.get("logs", []) + [f"[ingest] loaded manifest: {seed_assets_path} ({len(normalized)} seeds)"],
+        }
+
+    # 2) Dev fallback: bootstrap then persist manifest
+    raw = load_seed_cases(str(seed_cases_path))
+    enriched = []
+    for s in raw:
+        enriched.append(
+            bootstrap_seed_case(
+                workspace_dir=workspace_dir,
+                seed=s,
+                codeql=codeql,
+                overwrite_db=False,
+            )
+        )
+
+    save_seed_cases(str(seed_assets_path), enriched)
+    normalized = [normalize_seed_case(workspace_dir, s) for s in enriched]
+
+    return {
+        "seed_cases": normalized,
+        "logs": state.get("logs", []) + [
+            f"[ingest] bootstrapped from {seed_cases_path} and wrote manifest: {seed_assets_path} ({len(normalized)} seeds)"
+        ],
+    }
+
 
 
 # -----------------------------
@@ -209,11 +196,13 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
         }
 
     seed0 = seed_cases[0]
-    cve_id = seed0.get("cve_id") or seed0.get("id") or "UNKNOWN_CVE"
-    repo_path = Path(seed0.get("repo_path", "") or "")
-    db_path = seed0.get("db_path", "")
-    vuln_file_rel = seed0.get("vulnerable_file") or seed0.get("file_path") or seed0.get("vuln_file")
-    vuln_line = int(seed0.get("line_number") or seed0.get("vuln_line") or 1)
+    cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
+
+    # --- Canonical schema only (NO key-guessing) ---
+    repo_path = Path(seed0["repo_path"])
+    db_path = seed0["db_path"]
+    vuln_file_rel = seed0["vulnerable_file"]
+    vuln_line = int(seed0.get("vulnerable_line") or 1)
 
     baseline_query_path = seed0.get("baseline_query_path") or os.getenv("BASELINE_QUERY_PATH", "")
     codeql_search_paths = seed0.get("codeql_search_paths") or []
@@ -231,7 +220,7 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
     try:
         codeql = state.get("codeql_client")
         if codeql is None:
-            from app.codeql.client import CodeQLMCPClient  # adjust to your actual module path
+            from app.mcp.codeql_mcp import CodeQLMCPClient  # adjust to your actual module path
             codeql = CodeQLMCPClient()
 
         if baseline_query_path and db_path:
@@ -391,7 +380,7 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
 
     seed_cases = state.get("seed_cases", [])
     seed0 = seed_cases[0] if seed_cases else {}
-    cve_id = seed0.get("cve_id") or seed0.get("id") or "UNKNOWN_CVE"
+    cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
 
     diagnosis = state.get("active_diagnosis") or {}
     gap_kind = diagnosis.get("gap_kind", "unknown")
@@ -478,10 +467,12 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
         return {"active_decision": decision, "is_converged": False}
 
     seed0 = seed_cases[0]
-    cve_id = seed0.get("cve_id") or seed0.get("id") or "UNKNOWN_CVE"
-    db_path = seed0.get("db_path", "")
-    vuln_file_rel = seed0.get("vulnerable_file") or seed0.get("file_path") or seed0.get("vuln_file") or ""
-    vuln_line = int(seed0.get("line_number") or seed0.get("vuln_line") or 1)
+    cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
+
+    # --- Canonical schema only (NO key-guessing) ---
+    db_path = seed0["db_path"]
+    vuln_file_rel = seed0["vulnerable_file"]
+    vuln_line = int(seed0.get("vulnerable_line") or 1)
 
     codeql_search_paths = seed0.get("codeql_search_paths") or []
 
@@ -502,7 +493,7 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
     # Get codeql client
     codeql = state.get("codeql_client")
     if codeql is None:
-        from app.codeql.client import CodeQLMCPClient  # adjust if needed
+        from app.mcp.codeql_mcp import CodeQLMCPClient  # adjust if needed
         codeql = CodeQLMCPClient()
 
     # ---- 1) Compile the generated semantic pack (query compile) ----

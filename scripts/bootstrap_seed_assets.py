@@ -13,14 +13,11 @@ It then writes the enriched seed list to an output JSON file.
 """
 
 import argparse
-import json
 import logging
-from pathlib import Path
 from typing import Any, Dict, List
 
 from app.mcp.codeql_mcp import CodeQLMCPClient
-from app.utils.seed_bootstrap import bootstrap_seed_case, load_seed_cases, save_seed_cases
-
+from utils.seed_loader import bootstrap_seed_case, load_seed_cases, save_seed_cases
 
 logger = logging.getLogger("deepvuln.bootstrap")
 
@@ -41,23 +38,16 @@ def main() -> int:
 
     _configure_logging(args.verbose)
 
-    seeds: List[Dict[str, Any]] = load_seed_cases(args.seed_json)
-    if not seeds:
-        logger.error("No seeds found in %s", args.seed_json)
-        return 2
-
     codeql = CodeQLMCPClient()
-    if not codeql.available:
-        logger.error("CodeQL not found. Set CODEQL_CLI_PATH or add 'codeql' to PATH.")
-        return 3
 
+    seeds: List[Dict[str, Any]] = load_seed_cases(args.seed_json)
     out: List[Dict[str, Any]] = []
+
     for seed in seeds:
-        logger.info("Bootstrapping seed: %s", seed.get("cve_id") or seed.get("project_name"))
         try:
             enriched = bootstrap_seed_case(
-                seed,
                 workspace_dir=args.workspace_dir,
+                seed=seed,
                 codeql=codeql,
                 overwrite_db=args.overwrite_db,
             )
