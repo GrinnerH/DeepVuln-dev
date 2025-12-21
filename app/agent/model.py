@@ -19,14 +19,11 @@ import logging
 import os
 from typing import Iterable, Optional, Type
 
-from langchain_core.language_models.chat import BaseChatModel
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_core.language_models.fake_chat_models import FakeChatModel
-from langchain_dev_utils.chat_models import (
-    register_model_provider,
-    load_chat_model,
-)
+from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +60,6 @@ def _load_base_chat_model() -> BaseChatModel:
         or os.getenv("LITELLM_BASE_URL")
     )
 
-    # Register a provider alias so load_chat_model works uniformly
-    register_model_provider(
-        provider_name="DMXAPI",
-        chat_model=FakeChatModel,
-        base_url=base_url,
-    )
-
     try:
         logger.info(
             "Loading chat model",
@@ -78,7 +68,7 @@ def _load_base_chat_model() -> BaseChatModel:
                 "base_url": base_url,
             },
         )
-        return load_chat_model(f"DMXAPI:{model_name}")
+        return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url)
     except Exception as exc:
         logger.exception("Failed to load chat model", exc_info=exc)
         raise

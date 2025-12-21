@@ -1,0 +1,58 @@
+[
+  {
+    "project_name": "GPAC",
+    "cve_id": "CVE-2024-22749",
+    "cwe_id": "CWE-120",
+    "repo_url": "https://github.com/gpac/gpac.git",
+    "repo_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/repos/gpac",
+    "db_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/codeql_dbs/gpac",
+    "vulnerable_file": "src/isomedia/isom_write.c",
+    "target_function": "gf_isom_new_generic_sample_description",
+    "vulnerable_line": 4528,
+    "vuln_commit_sha": "8684dfb",
+    "fix_commit_sha": "012cd79",
+    "baseline_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
+    "regression_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
+    "codeql_search_paths": [
+      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-all/6.0.1",
+      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3",
+      "/mnt/d/Work_space/codeql/qlpacks",
+      "/mnt/d/Work_space/codeql"
+    ],
+    "_extra": {
+      "patch_url": "https://github.com/gpac/gpac/commit/7aef8038c6bdd310e65000704e39afaa0e721048",
+      "build_command": "./configure && make",
+      "description": "Buffer overflow in GPAC v2.3 in gf_isom_new_generic_sample_description when copying compressor_name into a fixed-size buffer without adequate bounds checking."
+    }
+  },
+  {
+    "project_name": "LibTIFF",
+    "cve_id": "CVE-2022-3627",
+    "cwe_id": "CWE-787",
+    "repo_url": "https://gitlab.com/libtiff/libtiff",
+    "repo_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/repos/libtiff",
+    "db_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/codeql_dbs/libtiff",
+    "vulnerable_file": "tools/tiffcrop.c",
+    "target_function": "extractImageSection",
+    "vulnerable_line": 554,
+    "vuln_commit_sha": null,
+    "fix_commit_sha": "236b7191f04c60d09ee836ae13b50f812c841047",
+    "baseline_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
+    "regression_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
+    "codeql_search_paths": [
+      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-all/6.0.1",
+      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3",
+      "/mnt/d/Work_space/codeql/qlpacks",
+      "/mnt/d/Work_space/codeql"
+    ],
+    "_extra": {
+      "patch_url": "https://gitlab.com/libtiff/libtiff/-/commit/236b7191f04c60d09ee836ae13b50f812c841047",
+      "build_command": "cmake -S . -B build && cmake --build build",
+      "description": "Out-of-bounds write in tiffcrop's extractImageSection in LibTIFF, fixed by adding bounds checks before copying image sections.",
+      "notes": {
+        "vendor_advisory_ref": "SUSE CVE page",
+        "fix_mentions": "Adds check to avoid writing past buffer in extractImageSection."
+      }
+    }
+  }
+]

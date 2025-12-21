@@ -16,6 +16,8 @@ import argparse
 import logging
 from typing import Any, Dict, List
 
+from dotenv import load_dotenv
+
 from app.mcp.codeql_mcp import CodeQLMCPClient
 from utils.seed_loader import bootstrap_seed_case, load_seed_cases, save_seed_cases
 
@@ -28,6 +30,7 @@ def _configure_logging(verbose: bool) -> None:
 
 
 def main() -> int:
+    load_dotenv(override=True)
     parser = argparse.ArgumentParser(description="Bootstrap DeepVuln seed assets")
     parser.add_argument("--seed-json", default="seeds/seed_cases.json")
     parser.add_argument("--out-json", default="seeds/seed_assets.json")

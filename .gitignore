@@ -5,3 +5,4 @@ data/
 __pycache__/
 .langgraph_api/
 trace/
+artifacts/

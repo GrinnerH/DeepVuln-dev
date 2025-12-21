@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,6 +128,11 @@ def normalize_seed_case(workspace_dir: str, seed: Dict[str, Any]) -> Dict[str, A
         "regression_query_path", "codeql_search_paths",
     }
 
+    env_search = os.environ.get("CODEQL_SEARCH_PATH", "")
+    env_paths = [p for p in env_search.split(os.pathsep) if p]
+    seed_search = seed.get("codeql_search_paths", [])
+    merged_search = list(dict.fromkeys([*seed_search, *env_paths]))
+
     normalized: Dict[str, Any] = {
         # identity
         "project_name": seed["project_name"],
@@ -153,7 +159,7 @@ def normalize_seed_case(workspace_dir: str, seed: Dict[str, Any]) -> Dict[str, A
         "regression_query_path": str(baseline_query) if baseline_query else None,
 
         # optional CodeQL search paths (project-controlled)
-        "codeql_search_paths": seed.get("codeql_search_paths", []),
+        "codeql_search_paths": merged_search,
 
         # preserve everything else for later use/debug
         "_extra": {k: v for k, v in seed.items() if k not in extra_keys},
@@ -235,10 +241,12 @@ def bootstrap_seed_case(
     """
     normalized = normalize_seed_case(workspace_dir, seed)
 
-    repo_path = Path(normalized["repo_path"])
-    db_path = Path(normalized["db_path"])
+    repo_path = Path(normalized["repo_path"]).expanduser().resolve()
+    db_path = Path(normalized["db_path"]).expanduser().resolve()
     repo_url = normalized["repo_url"]
     commit_sha = normalized.get("vuln_commit_sha")
+    normalized["repo_path"] = str(repo_path)
+    normalized["db_path"] = str(db_path)
 
     # 1) repo checkout
     _ensure_git_checkout(repo_url, repo_path, commit_sha)
@@ -251,7 +259,22 @@ def bootstrap_seed_case(
 
     if not db_path.exists():
         build_cmd = seed.get("build_command") or normalized.get("_extra", {}).get("build_command")
-        codeql.create_database(
+        if build_cmd and ("&&" in build_cmd or ";" in build_cmd):
+            script_path = repo_path / ".deepvuln_build.sh"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        build_cmd,
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            script_path.chmod(0o755)
+            build_cmd = f"bash {shlex.quote(str(script_path))}"
+        create_res = codeql.create_database(
             source_root=str(repo_path),
             db_path=str(db_path),
             language="cpp",
@@ -259,6 +282,10 @@ def bootstrap_seed_case(
             overwrite=False,
             cwd=str(repo_path),
         )
+        if not create_res.get("ok"):
+            raise SeedMaterialError(
+                f"CodeQL database create failed: {create_res.get('stderr') or create_res}"
+            )
 
     # 3) vuln line heuristic (for prompt windowing)
     if not normalized.get("vulnerable_line"):

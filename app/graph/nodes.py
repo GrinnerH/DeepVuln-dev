@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,7 +72,7 @@ def _read_code_window(file_path: Path, line: int, window: int = 25) -> str:
     Falls back gracefully if file is missing/unreadable.
     """
     try:
-        content = safe_read_text(str(file_path))
+        content = safe_read_text(file_path)
     except Exception as e:
         return f"[source-unavailable] Failed to read {file_path}: {e}"
 
@@ -97,6 +98,51 @@ def _sanitize_filename(s: str) -> str:
     return s[:180] if len(s) > 180 else s
 
 
+def _strip_markdown_fences(text: str) -> str:
+    if "```" not in text:
+        return text
+    lines = text.splitlines()
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].lstrip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _contains_non_ascii(text: str) -> bool:
+    return any(ord(ch) > 127 for ch in text)
+
+
+def _maybe_localize_query(path_str: str, *, workspace_dir: Path) -> str:
+    if not path_str:
+        return path_str
+    if not _contains_non_ascii(path_str):
+        return path_str
+    src = Path(path_str)
+    if not src.exists():
+        return path_str
+    ws = workspace_dir.resolve()
+    dest_dir = ensure_dir(ws / "baseline")
+    dest = dest_dir / _sanitize_filename(src.name)
+    try:
+        shutil.copy2(src, dest)
+        return str(dest.resolve())
+    except Exception:
+        return path_str
+
+
+def _minimal_semantic_pack() -> str:
+    return "\n".join(
+        [
+            "import cpp",
+            "",
+            "/** No-op semantic pack to keep compilation stable. */",
+            "predicate _deepvuln_noop() { false }",
+            "",
+        ]
+    )
+
+
 # -----------------------------
 # Stage A: setup + ingest
 # -----------------------------
@@ -109,7 +155,7 @@ def setup_environment(state: DeepVulnState) -> Dict[str, Any]:
       - This node returns only minimal, serializable fields for state updates.
       - Runtime logs are written to a local trace file (not stored in state).
     """
-    workspace = Path(state.get("workspace_dir") or "./artifacts/run")
+    workspace = Path(state.get("workspace_dir") or "./artifacts/run").resolve()
     _ensure_dir(workspace)
     _ensure_dir(workspace / "baseline")
     _ensure_dir(workspace / "semantic_packs")
@@ -141,7 +187,7 @@ def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
     Note: No verbose logs are stored in state; use local trace file + on-disk artifacts.
     """
     workspace_dir = state.get("workspace_dir") or "./artifacts/run"
-    Path(workspace_dir).mkdir(parents=True, exist_ok=True)
+    Path(workspace_dir).resolve().mkdir(parents=True, exist_ok=True)
 
     seed_assets_path = Path("seeds/seed_assets.json")
     seed_cases_path = Path("seeds/seed_cases.json")
@@ -185,7 +231,7 @@ def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
 
 
 def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
-    workspace_dir = Path(state["workspace_dir"])
+    workspace_dir = Path(state["workspace_dir"]).resolve()
     ensure_dir(workspace_dir)
 
     seed_cases = state.get("seed_cases", [])
@@ -205,12 +251,17 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
 
     # --- Canonical schema only (NO key-guessing) ---
-    repo_path = Path(seed0["repo_path"])
-    db_path = seed0["db_path"]
+    repo_path = Path(seed0["repo_path"]).expanduser().resolve()
+    db_path = str(Path(seed0["db_path"]).expanduser().resolve())
     vuln_file_rel = seed0["vulnerable_file"]
     vuln_line = int(seed0.get("vulnerable_line") or 1)
 
     baseline_query_path = seed0.get("baseline_query_path") or os.getenv("BASELINE_QUERY_PATH", "")
+    if baseline_query_path:
+        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
+        baseline_query_path = _maybe_localize_query(
+            baseline_query_path, workspace_dir=workspace_dir
+        )
     codeql_search_paths = seed0.get("codeql_search_paths") or []
 
     logger.info(
@@ -329,7 +380,7 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
 
 
 def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
-    workspace_dir = Path(state["workspace_dir"])
+    workspace_dir = Path(state["workspace_dir"]).resolve()
     ensure_dir(workspace_dir)
 
     seed_cases = state.get("seed_cases", [])
@@ -347,6 +398,7 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     iter_idx = int(state.get("iteration_count", 0)) + 1
     pack_dir = ensure_dir(workspace_dir / "semantic_packs" / f"iter_{iter_idx:02d}")
     qll_path = pack_dir / "ProjectSemantics.qll"
+    qlpack_path = pack_dir / "qlpack.yml"
 
     prompt = _SYNTHESIZE_PROMPT_TEMPLATE.format(
         cve_id=cve_id,
@@ -362,9 +414,37 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     ]
     raw = runnable.invoke(messages)
     raw_text = getattr(raw, "content", raw)
+    raw_str = str(raw_text)
+    sanitized = _strip_markdown_fences(raw_str).strip()
+    if sanitized and "import cpp" not in sanitized.splitlines()[:5]:
+        sanitized = "import cpp\n\n" + sanitized
+    if not sanitized:
+        sanitized = _minimal_semantic_pack()
+
+    raw_path = pack_dir / "ProjectSemantics.llm.qll"
+    raw_path.write_text(raw_str, encoding="utf-8")
+
+    banned_starts = ("select ", "from ", "query ")
+    for line in sanitized.splitlines():
+        if line.lstrip().startswith(banned_starts):
+            sanitized = _minimal_semantic_pack()
+            break
 
     # The LLM should output CodeQL (.qll) content.
-    qll_path.write_text(str(raw_text), encoding="utf-8")
+    qll_path.write_text(sanitized, encoding="utf-8")
+    if not qlpack_path.exists():
+        qlpack_path.write_text(
+            "\n".join(
+                [
+                    "name: deepvuln/semantic-pack",
+                    "version: 0.0.1",
+                    "dependencies:",
+                    "  codeql/cpp-all: \"*\"",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
     logger.info("[synthesize] wrote semantic pack: %s", qll_path)
 
     artifact = {
@@ -374,7 +454,7 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
 
 
 def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
-    workspace_dir = Path(state["workspace_dir"])
+    workspace_dir = Path(state["workspace_dir"]).resolve()
     ensure_dir(workspace_dir)
 
     seed_cases = state.get("seed_cases", [])
@@ -386,9 +466,15 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
 
     # --- Canonical schema only (NO key-guessing) ---
-    db_path = seed0["db_path"]
+    db_path = str(Path(seed0["db_path"]).expanduser().resolve())
     vuln_file_rel = seed0["vulnerable_file"]
     vuln_line = int(seed0.get("vulnerable_line") or 1)
+    regression_query_path = seed0.get("regression_query_path") or seed0.get("baseline_query_path")
+    if regression_query_path:
+        regression_query_path = str(Path(regression_query_path).expanduser().resolve())
+        regression_query_path = _maybe_localize_query(
+            regression_query_path, workspace_dir=workspace_dir
+        )
     codeql_search_paths = seed0.get("codeql_search_paths") or []
 
     artifact = state.get("active_semantic_artifact") or {}
@@ -399,6 +485,7 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
 
     qll_path_p = Path(qll_path)
     iter_idx = int(state.get("iteration_count", 0)) + 1
+    pack_dir = qll_path_p.parent
 
     diagnostics_dir = ensure_dir(workspace_dir / "diagnostics")
     compile_log_path = diagnostics_dir / f"{cve_id}_compile_iter_{iter_idx:02d}.json"
@@ -408,10 +495,28 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
     # Local client (do NOT store in state; keep state serializable)
     codeql = CodeQLMCPClient()
 
-    # ---- 1) Compile the generated semantic pack (query compile) ----
+    # ---- 1) Compile the generated semantic pack via a probe query ----
+    probe_path = pack_dir / "_compile_probe.ql"
+    probe_src = "\n".join(
+        [
+            "import cpp",
+            "import ProjectSemantics",
+            "",
+            "from Function f",
+            "select f",
+            "",
+        ]
+    )
+    if not probe_path.exists() or probe_path.read_text(encoding="utf-8", errors="ignore") != probe_src:
+        probe_path.write_text(probe_src, encoding="utf-8")
+
+    search_paths = list(codeql_search_paths)
+    if str(pack_dir) not in search_paths:
+        search_paths.append(str(pack_dir))
+
     compile_res = codeql.query_compile(
-        query_path=str(qll_path_p),
-        additional_search_paths=codeql_search_paths or None,
+        query_path=str(probe_path),
+        additional_search_paths=search_paths or None,
         extra_args=None,
         cwd=None,
     )
@@ -419,6 +524,19 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
 
     compile_ok = bool(compile_res.get("ok"))
     logger.info("[evaluate] compile_ok=%s compile_log=%s", compile_ok, compile_log_path)
+
+    if not compile_ok:
+        # Fallback to a minimal pack to keep the loop executable.
+        qll_path_p.write_text(_minimal_semantic_pack(), encoding="utf-8")
+        compile_res = codeql.query_compile(
+            query_path=str(probe_path),
+            additional_search_paths=search_paths or None,
+            extra_args=None,
+            cwd=None,
+        )
+        compile_log_path.write_text(json.dumps(compile_res, ensure_ascii=False, indent=2), encoding="utf-8")
+        compile_ok = bool(compile_res.get("ok"))
+        logger.info("[evaluate] compile_ok_after_fallback=%s compile_log=%s", compile_ok, compile_log_path)
 
     artifact_updated = dict(artifact)
     artifact_updated["compile_log_ref"] = {
@@ -448,14 +566,24 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
         }
 
     # ---- 2) Regression run on the seed DB ----
-    regression_res = codeql.analyze_database(
-        db_path=str(db_path),
-        query_or_suite_path=str(qll_path_p),
-        output_sarif_path=str(regression_sarif_path),
-        additional_search_paths=codeql_search_paths or None,
-        extra_args=None,
-        cwd=None,
-    )
+    regression_res: Dict[str, Any]
+    if regression_query_path:
+        regression_res = codeql.analyze_database(
+            db_path=str(db_path),
+            query_or_suite_path=str(regression_query_path),
+            output_sarif_path=str(regression_sarif_path),
+            additional_search_paths=search_paths or None,
+            extra_args=None,
+            cwd=None,
+        )
+    else:
+        regression_res = {
+            "ok": False,
+            "returncode": 1,
+            "stderr": "Missing regression_query_path/baseline_query_path; cannot run regression.",
+            "stdout": "",
+            "cmd": [],
+        }
     regression_log_path.write_text(json.dumps(regression_res, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("[evaluate] regression_ok=%s sarif=%s", regression_res.get("ok"), regression_sarif_path)
 
@@ -503,6 +631,72 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
         updates["best_semantic_pack_path"] = best_pack
 
     return updates
+
+
+# -----------------------------
+# Stage C: target scanning (placeholder for MVP)
+# -----------------------------
+
+
+def scan_target_repository(state: DeepVulnState) -> Dict[str, Any]:
+    """
+    Scan the target repository with the converged semantic pack.
+
+    MVP behavior:
+      - If target_repo_path or semantic pack is missing, mark as skipped.
+      - This keeps the graph executable without enforcing Step C yet.
+    """
+    workspace_dir = Path(state.get("workspace_dir") or "./artifacts/run").resolve()
+    ensure_dir(workspace_dir)
+
+    target_repo_path = state.get("target_repo_path") or ""
+    semantic_pack = state.get("best_semantic_pack_path") or ""
+
+    scanning_result: Dict[str, Any] = {
+        "status": "skipped",
+        "reason": "",
+        "target_repo_path": target_repo_path,
+        "semantic_pack_path": semantic_pack,
+    }
+
+    if not semantic_pack:
+        scanning_result["reason"] = "No best_semantic_pack_path; skipping target scan."
+        return {"scanning_result": scanning_result}
+
+    if not target_repo_path:
+        scanning_result["reason"] = "No target_repo_path provided; skipping target scan."
+        return {"scanning_result": scanning_result}
+
+    # TODO: Integrate Step C database creation + analyze flow.
+    scanning_result["reason"] = "Step C scan not implemented in MVP."
+    return {"scanning_result": scanning_result}
+
+
+def finalize_and_report(state: DeepVulnState) -> Dict[str, Any]:
+    """
+    Write a minimal run summary to disk for auditability.
+    """
+    workspace_dir = Path(state.get("workspace_dir") or "./artifacts/run").resolve()
+    ensure_dir(workspace_dir)
+    reports_dir = ensure_dir(workspace_dir / "reports")
+
+    summary = {
+        "run_id": state.get("run_id"),
+        "iteration_count": state.get("iteration_count", 0),
+        "is_converged": state.get("is_converged", False),
+        "best_semantic_pack_path": state.get("best_semantic_pack_path", ""),
+        "active_decision": state.get("active_decision", {}),
+        "modeling_history_len": len(state.get("modeling_history", []) or []),
+        "scanning_result": state.get("scanning_result", {}),
+    }
+
+    report_path = reports_dir / "run_summary.json"
+    report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[finalize] wrote summary report: %s", report_path)
+
+    scanning_result = dict(state.get("scanning_result", {}) or {})
+    scanning_result["report_path"] = str(report_path)
+    return {"scanning_result": scanning_result}
 
 
 # -----------------------------

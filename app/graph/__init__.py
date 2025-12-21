@@ -1,3 +1,3 @@
-from app.graph.builder import build_graph
+from app.graph.graph import build_graph
 
 __all__ = ["build_graph"]

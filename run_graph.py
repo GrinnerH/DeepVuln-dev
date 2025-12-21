@@ -1,9 +1,12 @@
 # run_graph.py
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
 from app.graph.graph import build_graph
 
 if __name__ == "__main__":
+    load_dotenv(override=True)
     graph = build_graph()
     # Minimal initial state: point to seeds file and target info later.
     init = {

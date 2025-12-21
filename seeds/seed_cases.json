@@ -8,7 +8,7 @@
     "fix_commit_sha": "012cd79",
     "patch_url": "https://github.com/gpac/gpac/commit/7aef8038c6bdd310e65000704e39afaa0e721048",
     "build_command": "./configure && make",
-    "vulnerable_file": "isomedia/isom_write.c",
+    "vulnerable_file": "src/isomedia/isom_write.c",
     "target_function": "gf_isom_new_generic_sample_description",
     "description": "Buffer overflow in GPAC v2.3 in gf_isom_new_generic_sample_description when copying compressor_name into a fixed-size buffer without adequate bounds checking."
   },
