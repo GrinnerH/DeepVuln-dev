@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deepvuln.local/schemas/semantic_candidates.schema.json",
+  "title": "SemanticCandidates",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "wrapper_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "func": { "type": "string" },
+          "arity": { "type": "integer", "minimum": 0 },
+          "evidence_calls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "file": { "type": "string" },
+                "line": { "type": "integer", "minimum": 1 },
+                "call": { "type": "string" }
+              },
+              "required": ["file", "line", "call"]
+            }
+          },
+          "heuristic": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "dest_idx_guess": { "type": "integer", "minimum": 0 },
+              "size_idx_guess": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "required": ["func", "arity"]
+      }
+    },
+    "capacity_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["macro", "field"] },
+          "name": { "type": "string" },
+          "evidence": { "type": "string" }
+        },
+        "required": ["kind", "name"]
+      }
+    },
+    "guard_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "expr": { "type": "string" },
+          "evidence": { "type": "string" }
+        },
+        "required": ["file", "line", "expr"]
+      }
+    }
+  },
+  "required": ["wrapper_candidates", "capacity_candidates", "guard_candidates"]
+}

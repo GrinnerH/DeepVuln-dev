@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deepvuln.local/schemas/semantic_facts.schema.json",
+  "title": "SemanticFacts",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": { "type": "string", "default": "v1" },
+    "project": { "type": "string" },
+    "cwe": { "type": "string" },
+    "wrapper_models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["memcpy_like", "strcpy_like", "sprintf_like", "custom_write"] },
+          "dest_arg": { "type": "integer", "minimum": 0 },
+          "size_arg": { "type": ["integer", "null"], "minimum": 0 },
+          "access_type": { "type": "string", "enum": ["write", "read", "readwrite"], "default": "write" },
+          "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+          "rationale": { "type": "string" }
+        },
+        "required": ["name", "kind", "dest_arg", "size_arg"]
+      }
+    },
+    "capacity_macros": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "capacity_fields": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "guard_patterns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["len_le_cap", "len_lt_cap", "min_len_cap", "checked_copy", "other"] },
+          "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+          "rationale": { "type": "string" }
+        },
+        "required": ["kind"]
+      }
+    }
+  },
+  "required": ["wrapper_models", "capacity_macros", "capacity_fields", "guard_patterns"]
+}
