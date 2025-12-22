@@ -10,6 +10,8 @@ def json_loads_best_effort(text: str, fallback: Optional[Dict[str, Any]] = None)
     - Else try to parse the first '{' ... last '}' substring.
     """
     text = (text or "").strip()
+    if fallback is None:
+        fallback = {}
     if not text:
         return fallback
 

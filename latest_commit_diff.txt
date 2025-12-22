@@ -1,0 +1,712 @@
+commit d462c5d64d57b7d301af56d6da8b3d1b28ad0e35
+Author: GrinnerH <wangwenhao.work@gmail.com>
+Date:   Sun Dec 21 15:13:22 2025 +0800
+
+    当前代码修改汇总
+    
+      - .env：更新 BASELINE_QUERY_PATH 到 qlpacks 内的 OverflowBuffer.ql，并扩展 CODEQL_SEARCH_PATH（包含 cpp-all/cpp-queries 版本路径）。
+      - scripts/bootstrap_seed_assets.py：增加 load_dotenv(override=True)，保证 .env 覆盖生效。
+      - run_graph.py：同样 load_dotenv(override=True)。
+      - app/agent/model.py：修复 LangChain 依赖，改用 ChatOpenAI 直接加载；修正 BaseChatModel 导入。
+      - app/graph/__init__.py：修正导入路径到 app/graph/graph.py。
+      - app/graph/nodes.py：
+          - 新增 scan_target_repository/finalize_and_report 最小实现。
+          - workspace 统一 resolve 成绝对路径，避免相对路径导致 SARIF 写入失败。
+          - 诊断/评估时规范化 repo/db/query 绝对路径。
+          - 编译改为 _compile_probe.ql，并加 fallback 最小语义包，避免 LLM 输出语法错误导致崩溃。
+          - 增加 markdown fence 清理、空内容兜底等鲁棒性处理。
+      - utils/jsonx.py：json_loads_best_effort 支持 fallback 参数。
+      - utils/seed_loader.py：
+    
+      生成/新增文件
+    
+      - seeds/seed_assets.json（Step A 输出，包含绝对路径/搜索路径）
+
+diff --git a/.gitignore b/.gitignore
+index 221c252..a485258 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,4 +4,5 @@ data/
+ .uvcache
+ __pycache__/
+ .langgraph_api/
+-trace/
+\ No newline at end of file
++trace/
++artifacts/
+diff --git a/app/agent/model.py b/app/agent/model.py
+index 86314d1..c6faf14 100644
+--- a/app/agent/model.py
++++ b/app/agent/model.py
+@@ -19,14 +19,11 @@ import logging
+ import os
+ from typing import Iterable, Optional, Type
+ 
+-from langchain_core.language_models.chat import BaseChatModel
++from langchain_core.language_models.chat_models import BaseChatModel
+ from langchain_core.runnables import Runnable
+ from langchain_core.tools import BaseTool
+ from langchain_core.language_models.fake_chat_models import FakeChatModel
+-from langchain_dev_utils.chat_models import (
+-    register_model_provider,
+-    load_chat_model,
+-)
++from langchain_openai import ChatOpenAI
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -63,13 +60,6 @@ def _load_base_chat_model() -> BaseChatModel:
+         or os.getenv("LITELLM_BASE_URL")
+     )
+ 
+-    # Register a provider alias so load_chat_model works uniformly
+-    register_model_provider(
+-        provider_name="DMXAPI",
+-        chat_model=FakeChatModel,
+-        base_url=base_url,
+-    )
+-
+     try:
+         logger.info(
+             "Loading chat model",
+@@ -78,7 +68,7 @@ def _load_base_chat_model() -> BaseChatModel:
+                 "base_url": base_url,
+             },
+         )
+-        return load_chat_model(f"DMXAPI:{model_name}")
++        return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url)
+     except Exception as exc:
+         logger.exception("Failed to load chat model", exc_info=exc)
+         raise
+@@ -147,4 +137,4 @@ def build_chat_model(
+     Backward-compatible alias for older node code.
+     model_name is accepted for compatibility; actual selection is via env OPENAI_MODEL.
+     """
+-    return build_runnable(tools=tools, structured_schema=structured_schema)
+\ No newline at end of file
++    return build_runnable(tools=tools, structured_schema=structured_schema)
+diff --git a/app/graph/__init__.py b/app/graph/__init__.py
+index 89d10c3..936c405 100644
+--- a/app/graph/__init__.py
++++ b/app/graph/__init__.py
+@@ -1,3 +1,3 @@
+-from app.graph.builder import build_graph
++from app.graph.graph import build_graph
+ 
+ __all__ = ["build_graph"]
+diff --git a/app/graph/nodes.py b/app/graph/nodes.py
+index 6c486db..219a4fa 100644
+--- a/app/graph/nodes.py
++++ b/app/graph/nodes.py
+@@ -4,6 +4,7 @@ import json
+ import logging
+ import os
+ import re
++import shutil
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -71,7 +72,7 @@ def _read_code_window(file_path: Path, line: int, window: int = 25) -> str:
+     Falls back gracefully if file is missing/unreadable.
+     """
+     try:
+-        content = safe_read_text(str(file_path))
++        content = safe_read_text(file_path)
+     except Exception as e:
+         return f"[source-unavailable] Failed to read {file_path}: {e}"
+ 
+@@ -97,6 +98,51 @@ def _sanitize_filename(s: str) -> str:
+     return s[:180] if len(s) > 180 else s
+ 
+ 
++def _strip_markdown_fences(text: str) -> str:
++    if "```" not in text:
++        return text
++    lines = text.splitlines()
++    if lines and lines[0].lstrip().startswith("```"):
++        lines = lines[1:]
++    if lines and lines[-1].lstrip().startswith("```"):
++        lines = lines[:-1]
++    return "\n".join(lines).strip()
++
++
++def _contains_non_ascii(text: str) -> bool:
++    return any(ord(ch) > 127 for ch in text)
++
++
++def _maybe_localize_query(path_str: str, *, workspace_dir: Path) -> str:
++    if not path_str:
++        return path_str
++    if not _contains_non_ascii(path_str):
++        return path_str
++    src = Path(path_str)
++    if not src.exists():
++        return path_str
++    ws = workspace_dir.resolve()
++    dest_dir = ensure_dir(ws / "baseline")
++    dest = dest_dir / _sanitize_filename(src.name)
++    try:
++        shutil.copy2(src, dest)
++        return str(dest.resolve())
++    except Exception:
++        return path_str
++
++
++def _minimal_semantic_pack() -> str:
++    return "\n".join(
++        [
++            "import cpp",
++            "",
++            "/** No-op semantic pack to keep compilation stable. */",
++            "predicate _deepvuln_noop() { false }",
++            "",
++        ]
++    )
++
++
+ # -----------------------------
+ # Stage A: setup + ingest
+ # -----------------------------
+@@ -109,7 +155,7 @@ def setup_environment(state: DeepVulnState) -> Dict[str, Any]:
+       - This node returns only minimal, serializable fields for state updates.
+       - Runtime logs are written to a local trace file (not stored in state).
+     """
+-    workspace = Path(state.get("workspace_dir") or "./artifacts/run")
++    workspace = Path(state.get("workspace_dir") or "./artifacts/run").resolve()
+     _ensure_dir(workspace)
+     _ensure_dir(workspace / "baseline")
+     _ensure_dir(workspace / "semantic_packs")
+@@ -141,7 +187,7 @@ def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
+     Note: No verbose logs are stored in state; use local trace file + on-disk artifacts.
+     """
+     workspace_dir = state.get("workspace_dir") or "./artifacts/run"
+-    Path(workspace_dir).mkdir(parents=True, exist_ok=True)
++    Path(workspace_dir).resolve().mkdir(parents=True, exist_ok=True)
+ 
+     seed_assets_path = Path("seeds/seed_assets.json")
+     seed_cases_path = Path("seeds/seed_cases.json")
+@@ -185,7 +231,7 @@ def ingest_seed_material(state: DeepVulnState) -> Dict[str, Any]:
+ 
+ 
+ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
+-    workspace_dir = Path(state["workspace_dir"])
++    workspace_dir = Path(state["workspace_dir"]).resolve()
+     ensure_dir(workspace_dir)
+ 
+     seed_cases = state.get("seed_cases", [])
+@@ -205,12 +251,17 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
+     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
+ 
+     # --- Canonical schema only (NO key-guessing) ---
+-    repo_path = Path(seed0["repo_path"])
+-    db_path = seed0["db_path"]
++    repo_path = Path(seed0["repo_path"]).expanduser().resolve()
++    db_path = str(Path(seed0["db_path"]).expanduser().resolve())
+     vuln_file_rel = seed0["vulnerable_file"]
+     vuln_line = int(seed0.get("vulnerable_line") or 1)
+ 
+     baseline_query_path = seed0.get("baseline_query_path") or os.getenv("BASELINE_QUERY_PATH", "")
++    if baseline_query_path:
++        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
++        baseline_query_path = _maybe_localize_query(
++            baseline_query_path, workspace_dir=workspace_dir
++        )
+     codeql_search_paths = seed0.get("codeql_search_paths") or []
+ 
+     logger.info(
+@@ -329,7 +380,7 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
+ 
+ 
+ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
+-    workspace_dir = Path(state["workspace_dir"])
++    workspace_dir = Path(state["workspace_dir"]).resolve()
+     ensure_dir(workspace_dir)
+ 
+     seed_cases = state.get("seed_cases", [])
+@@ -347,6 +398,7 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
+     iter_idx = int(state.get("iteration_count", 0)) + 1
+     pack_dir = ensure_dir(workspace_dir / "semantic_packs" / f"iter_{iter_idx:02d}")
+     qll_path = pack_dir / "ProjectSemantics.qll"
++    qlpack_path = pack_dir / "qlpack.yml"
+ 
+     prompt = _SYNTHESIZE_PROMPT_TEMPLATE.format(
+         cve_id=cve_id,
+@@ -362,9 +414,37 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
+     ]
+     raw = runnable.invoke(messages)
+     raw_text = getattr(raw, "content", raw)
++    raw_str = str(raw_text)
++    sanitized = _strip_markdown_fences(raw_str).strip()
++    if sanitized and "import cpp" not in sanitized.splitlines()[:5]:
++        sanitized = "import cpp\n\n" + sanitized
++    if not sanitized:
++        sanitized = _minimal_semantic_pack()
++
++    raw_path = pack_dir / "ProjectSemantics.llm.qll"
++    raw_path.write_text(raw_str, encoding="utf-8")
++
++    banned_starts = ("select ", "from ", "query ")
++    for line in sanitized.splitlines():
++        if line.lstrip().startswith(banned_starts):
++            sanitized = _minimal_semantic_pack()
++            break
+ 
+     # The LLM should output CodeQL (.qll) content.
+-    qll_path.write_text(str(raw_text), encoding="utf-8")
++    qll_path.write_text(sanitized, encoding="utf-8")
++    if not qlpack_path.exists():
++        qlpack_path.write_text(
++            "\n".join(
++                [
++                    "name: deepvuln/semantic-pack",
++                    "version: 0.0.1",
++                    "dependencies:",
++                    "  codeql/cpp-all: \"*\"",
++                    "",
++                ]
++            ),
++            encoding="utf-8",
++        )
+     logger.info("[synthesize] wrote semantic pack: %s", qll_path)
+ 
+     artifact = {
+@@ -374,7 +454,7 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
+ 
+ 
+ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
+-    workspace_dir = Path(state["workspace_dir"])
++    workspace_dir = Path(state["workspace_dir"]).resolve()
+     ensure_dir(workspace_dir)
+ 
+     seed_cases = state.get("seed_cases", [])
+@@ -386,9 +466,15 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
+     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
+ 
+     # --- Canonical schema only (NO key-guessing) ---
+-    db_path = seed0["db_path"]
++    db_path = str(Path(seed0["db_path"]).expanduser().resolve())
+     vuln_file_rel = seed0["vulnerable_file"]
+     vuln_line = int(seed0.get("vulnerable_line") or 1)
++    regression_query_path = seed0.get("regression_query_path") or seed0.get("baseline_query_path")
++    if regression_query_path:
++        regression_query_path = str(Path(regression_query_path).expanduser().resolve())
++        regression_query_path = _maybe_localize_query(
++            regression_query_path, workspace_dir=workspace_dir
++        )
+     codeql_search_paths = seed0.get("codeql_search_paths") or []
+ 
+     artifact = state.get("active_semantic_artifact") or {}
+@@ -399,6 +485,7 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
+ 
+     qll_path_p = Path(qll_path)
+     iter_idx = int(state.get("iteration_count", 0)) + 1
++    pack_dir = qll_path_p.parent
+ 
+     diagnostics_dir = ensure_dir(workspace_dir / "diagnostics")
+     compile_log_path = diagnostics_dir / f"{cve_id}_compile_iter_{iter_idx:02d}.json"
+@@ -408,10 +495,28 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
+     # Local client (do NOT store in state; keep state serializable)
+     codeql = CodeQLMCPClient()
+ 
+-    # ---- 1) Compile the generated semantic pack (query compile) ----
++    # ---- 1) Compile the generated semantic pack via a probe query ----
++    probe_path = pack_dir / "_compile_probe.ql"
++    probe_src = "\n".join(
++        [
++            "import cpp",
++            "import ProjectSemantics",
++            "",
++            "from Function f",
++            "select f",
++            "",
++        ]
++    )
++    if not probe_path.exists() or probe_path.read_text(encoding="utf-8", errors="ignore") != probe_src:
++        probe_path.write_text(probe_src, encoding="utf-8")
++
++    search_paths = list(codeql_search_paths)
++    if str(pack_dir) not in search_paths:
++        search_paths.append(str(pack_dir))
++
+     compile_res = codeql.query_compile(
+-        query_path=str(qll_path_p),
+-        additional_search_paths=codeql_search_paths or None,
++        query_path=str(probe_path),
++        additional_search_paths=search_paths or None,
+         extra_args=None,
+         cwd=None,
+     )
+@@ -420,6 +525,19 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
+     compile_ok = bool(compile_res.get("ok"))
+     logger.info("[evaluate] compile_ok=%s compile_log=%s", compile_ok, compile_log_path)
+ 
++    if not compile_ok:
++        # Fallback to a minimal pack to keep the loop executable.
++        qll_path_p.write_text(_minimal_semantic_pack(), encoding="utf-8")
++        compile_res = codeql.query_compile(
++            query_path=str(probe_path),
++            additional_search_paths=search_paths or None,
++            extra_args=None,
++            cwd=None,
++        )
++        compile_log_path.write_text(json.dumps(compile_res, ensure_ascii=False, indent=2), encoding="utf-8")
++        compile_ok = bool(compile_res.get("ok"))
++        logger.info("[evaluate] compile_ok_after_fallback=%s compile_log=%s", compile_ok, compile_log_path)
++
+     artifact_updated = dict(artifact)
+     artifact_updated["compile_log_ref"] = {
+         "kind": "diagnostic_log",
+@@ -448,14 +566,24 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
+         }
+ 
+     # ---- 2) Regression run on the seed DB ----
+-    regression_res = codeql.analyze_database(
+-        db_path=str(db_path),
+-        query_or_suite_path=str(qll_path_p),
+-        output_sarif_path=str(regression_sarif_path),
+-        additional_search_paths=codeql_search_paths or None,
+-        extra_args=None,
+-        cwd=None,
+-    )
++    regression_res: Dict[str, Any]
++    if regression_query_path:
++        regression_res = codeql.analyze_database(
++            db_path=str(db_path),
++            query_or_suite_path=str(regression_query_path),
++            output_sarif_path=str(regression_sarif_path),
++            additional_search_paths=search_paths or None,
++            extra_args=None,
++            cwd=None,
++        )
++    else:
++        regression_res = {
++            "ok": False,
++            "returncode": 1,
++            "stderr": "Missing regression_query_path/baseline_query_path; cannot run regression.",
++            "stdout": "",
++            "cmd": [],
++        }
+     regression_log_path.write_text(json.dumps(regression_res, ensure_ascii=False, indent=2), encoding="utf-8")
+     logger.info("[evaluate] regression_ok=%s sarif=%s", regression_res.get("ok"), regression_sarif_path)
+ 
+@@ -505,6 +633,72 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
+     return updates
+ 
+ 
++# -----------------------------
++# Stage C: target scanning (placeholder for MVP)
++# -----------------------------
++
++
++def scan_target_repository(state: DeepVulnState) -> Dict[str, Any]:
++    """
++    Scan the target repository with the converged semantic pack.
++
++    MVP behavior:
++      - If target_repo_path or semantic pack is missing, mark as skipped.
++      - This keeps the graph executable without enforcing Step C yet.
++    """
++    workspace_dir = Path(state.get("workspace_dir") or "./artifacts/run").resolve()
++    ensure_dir(workspace_dir)
++
++    target_repo_path = state.get("target_repo_path") or ""
++    semantic_pack = state.get("best_semantic_pack_path") or ""
++
++    scanning_result: Dict[str, Any] = {
++        "status": "skipped",
++        "reason": "",
++        "target_repo_path": target_repo_path,
++        "semantic_pack_path": semantic_pack,
++    }
++
++    if not semantic_pack:
++        scanning_result["reason"] = "No best_semantic_pack_path; skipping target scan."
++        return {"scanning_result": scanning_result}
++
++    if not target_repo_path:
++        scanning_result["reason"] = "No target_repo_path provided; skipping target scan."
++        return {"scanning_result": scanning_result}
++
++    # TODO: Integrate Step C database creation + analyze flow.
++    scanning_result["reason"] = "Step C scan not implemented in MVP."
++    return {"scanning_result": scanning_result}
++
++
++def finalize_and_report(state: DeepVulnState) -> Dict[str, Any]:
++    """
++    Write a minimal run summary to disk for auditability.
++    """
++    workspace_dir = Path(state.get("workspace_dir") or "./artifacts/run").resolve()
++    ensure_dir(workspace_dir)
++    reports_dir = ensure_dir(workspace_dir / "reports")
++
++    summary = {
++        "run_id": state.get("run_id"),
++        "iteration_count": state.get("iteration_count", 0),
++        "is_converged": state.get("is_converged", False),
++        "best_semantic_pack_path": state.get("best_semantic_pack_path", ""),
++        "active_decision": state.get("active_decision", {}),
++        "modeling_history_len": len(state.get("modeling_history", []) or []),
++        "scanning_result": state.get("scanning_result", {}),
++    }
++
++    report_path = reports_dir / "run_summary.json"
++    report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
++    logger.info("[finalize] wrote summary report: %s", report_path)
++
++    scanning_result = dict(state.get("scanning_result", {}) or {})
++    scanning_result["report_path"] = str(report_path)
++    return {"scanning_result": scanning_result}
++
++
+ # -----------------------------
+ # Utility: SARIF parsing / hit check
+ # -----------------------------
+diff --git a/run_graph.py b/run_graph.py
+index b115f19..5b3d4a5 100644
+--- a/run_graph.py
++++ b/run_graph.py
+@@ -1,9 +1,12 @@
+ # run_graph.py
+ from __future__ import annotations
+ 
++from dotenv import load_dotenv
++
+ from app.graph.graph import build_graph
+ 
+ if __name__ == "__main__":
++    load_dotenv(override=True)
+     graph = build_graph()
+     # Minimal initial state: point to seeds file and target info later.
+     init = {
+diff --git a/scripts/bootstrap_seed_assets.py b/scripts/bootstrap_seed_assets.py
+index 738e6b1..54668ae 100644
+--- a/scripts/bootstrap_seed_assets.py
++++ b/scripts/bootstrap_seed_assets.py
+@@ -16,6 +16,8 @@ import argparse
+ import logging
+ from typing import Any, Dict, List
+ 
++from dotenv import load_dotenv
++
+ from app.mcp.codeql_mcp import CodeQLMCPClient
+ from utils.seed_loader import bootstrap_seed_case, load_seed_cases, save_seed_cases
+ 
+@@ -28,6 +30,7 @@ def _configure_logging(verbose: bool) -> None:
+ 
+ 
+ def main() -> int:
++    load_dotenv(override=True)
+     parser = argparse.ArgumentParser(description="Bootstrap DeepVuln seed assets")
+     parser.add_argument("--seed-json", default="seeds/seed_cases.json")
+     parser.add_argument("--out-json", default="seeds/seed_assets.json")
+diff --git a/seeds/seed_assets.json b/seeds/seed_assets.json
+new file mode 100644
+index 0000000..29a274e
+--- /dev/null
++++ b/seeds/seed_assets.json
+@@ -0,0 +1,58 @@
++[
++  {
++    "project_name": "GPAC",
++    "cve_id": "CVE-2024-22749",
++    "cwe_id": "CWE-120",
++    "repo_url": "https://github.com/gpac/gpac.git",
++    "repo_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/repos/gpac",
++    "db_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/codeql_dbs/gpac",
++    "vulnerable_file": "src/isomedia/isom_write.c",
++    "target_function": "gf_isom_new_generic_sample_description",
++    "vulnerable_line": 4528,
++    "vuln_commit_sha": "8684dfb",
++    "fix_commit_sha": "012cd79",
++    "baseline_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
++    "regression_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
++    "codeql_search_paths": [
++      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-all/6.0.1",
++      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3",
++      "/mnt/d/Work_space/codeql/qlpacks",
++      "/mnt/d/Work_space/codeql"
++    ],
++    "_extra": {
++      "patch_url": "https://github.com/gpac/gpac/commit/7aef8038c6bdd310e65000704e39afaa0e721048",
++      "build_command": "./configure && make",
++      "description": "Buffer overflow in GPAC v2.3 in gf_isom_new_generic_sample_description when copying compressor_name into a fixed-size buffer without adequate bounds checking."
++    }
++  },
++  {
++    "project_name": "LibTIFF",
++    "cve_id": "CVE-2022-3627",
++    "cwe_id": "CWE-787",
++    "repo_url": "https://gitlab.com/libtiff/libtiff",
++    "repo_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/repos/libtiff",
++    "db_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/codeql_dbs/libtiff",
++    "vulnerable_file": "tools/tiffcrop.c",
++    "target_function": "extractImageSection",
++    "vulnerable_line": 554,
++    "vuln_commit_sha": null,
++    "fix_commit_sha": "236b7191f04c60d09ee836ae13b50f812c841047",
++    "baseline_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
++    "regression_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",
++    "codeql_search_paths": [
++      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-all/6.0.1",
++      "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3",
++      "/mnt/d/Work_space/codeql/qlpacks",
++      "/mnt/d/Work_space/codeql"
++    ],
++    "_extra": {
++      "patch_url": "https://gitlab.com/libtiff/libtiff/-/commit/236b7191f04c60d09ee836ae13b50f812c841047",
++      "build_command": "cmake -S . -B build && cmake --build build",
++      "description": "Out-of-bounds write in tiffcrop's extractImageSection in LibTIFF, fixed by adding bounds checks before copying image sections.",
++      "notes": {
++        "vendor_advisory_ref": "SUSE CVE page",
++        "fix_mentions": "Adds check to avoid writing past buffer in extractImageSection."
++      }
++    }
++  }
++]
+\ No newline at end of file
+diff --git a/seeds/seed_cases.json b/seeds/seed_cases.json
+index 268fd56..0365b5e 100644
+--- a/seeds/seed_cases.json
++++ b/seeds/seed_cases.json
+@@ -8,7 +8,7 @@
+     "fix_commit_sha": "012cd79",
+     "patch_url": "https://github.com/gpac/gpac/commit/7aef8038c6bdd310e65000704e39afaa0e721048",
+     "build_command": "./configure && make",
+-    "vulnerable_file": "isomedia/isom_write.c",
++    "vulnerable_file": "src/isomedia/isom_write.c",
+     "target_function": "gf_isom_new_generic_sample_description",
+     "description": "Buffer overflow in GPAC v2.3 in gf_isom_new_generic_sample_description when copying compressor_name into a fixed-size buffer without adequate bounds checking."
+   },
+@@ -29,4 +29,4 @@
+       "fix_mentions": "Adds check to avoid writing past buffer in extractImageSection."
+     }
+   }
+-]
+\ No newline at end of file
++]
+diff --git a/utils/jsonx.py b/utils/jsonx.py
+index 6b1fb0a..7f4805a 100644
+--- a/utils/jsonx.py
++++ b/utils/jsonx.py
+@@ -3,7 +3,7 @@ import json
+ from typing import Any, Dict, List, Optional
+ 
+ 
+-def json_loads_best_effort(text: str) -> Optional[Dict[str, Any]]:
++def json_loads_best_effort(text: str, fallback: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+     """
+     Best-effort JSON extraction:
+     - If text is pure JSON, parse directly.
+@@ -11,11 +11,11 @@ def json_loads_best_effort(text: str) -> Optional[Dict[str, Any]]:
+     """
+     text = (text or "").strip()
+     if not text:
+-        return None
++        return fallback
+ 
+     try:
+         obj = json.loads(text)
+-        return obj if isinstance(obj, dict) else None
++        return obj if isinstance(obj, dict) else fallback
+     except Exception:
+         pass
+ 
+@@ -24,11 +24,11 @@ def json_loads_best_effort(text: str) -> Optional[Dict[str, Any]]:
+     if l >= 0 and r > l:
+         try:
+             obj = json.loads(text[l : r + 1])
+-            return obj if isinstance(obj, dict) else None
++            return obj if isinstance(obj, dict) else fallback
+         except Exception:
+-            return None
++            return fallback
+ 
+-    return None
++    return fallback
+ 
+ 
+ def ensure_list(x: Any) -> List[Any]:
+diff --git a/utils/seed_loader.py b/utils/seed_loader.py
+index c25aff1..a137a2c 100644
+--- a/utils/seed_loader.py
++++ b/utils/seed_loader.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ import json
+ import os
+ import re
++import shlex
+ import subprocess
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -127,6 +128,11 @@ def normalize_seed_case(workspace_dir: str, seed: Dict[str, Any]) -> Dict[str, A
+         "regression_query_path", "codeql_search_paths",
+     }
+ 
++    env_search = os.environ.get("CODEQL_SEARCH_PATH", "")
++    env_paths = [p for p in env_search.split(os.pathsep) if p]
++    seed_search = seed.get("codeql_search_paths", [])
++    merged_search = list(dict.fromkeys([*seed_search, *env_paths]))
++
+     normalized: Dict[str, Any] = {
+         # identity
+         "project_name": seed["project_name"],
+@@ -153,7 +159,7 @@ def normalize_seed_case(workspace_dir: str, seed: Dict[str, Any]) -> Dict[str, A
+         "regression_query_path": str(baseline_query) if baseline_query else None,
+ 
+         # optional CodeQL search paths (project-controlled)
+-        "codeql_search_paths": seed.get("codeql_search_paths", []),
++        "codeql_search_paths": merged_search,
+ 
+         # preserve everything else for later use/debug
+         "_extra": {k: v for k, v in seed.items() if k not in extra_keys},
+@@ -235,10 +241,12 @@ def bootstrap_seed_case(
+     """
+     normalized = normalize_seed_case(workspace_dir, seed)
+ 
+-    repo_path = Path(normalized["repo_path"])
+-    db_path = Path(normalized["db_path"])
++    repo_path = Path(normalized["repo_path"]).expanduser().resolve()
++    db_path = Path(normalized["db_path"]).expanduser().resolve()
+     repo_url = normalized["repo_url"]
+     commit_sha = normalized.get("vuln_commit_sha")
++    normalized["repo_path"] = str(repo_path)
++    normalized["db_path"] = str(db_path)
+ 
+     # 1) repo checkout
+     _ensure_git_checkout(repo_url, repo_path, commit_sha)
+@@ -251,7 +259,22 @@ def bootstrap_seed_case(
+ 
+     if not db_path.exists():
+         build_cmd = seed.get("build_command") or normalized.get("_extra", {}).get("build_command")
+-        codeql.create_database(
++        if build_cmd and ("&&" in build_cmd or ";" in build_cmd):
++            script_path = repo_path / ".deepvuln_build.sh"
++            script_path.write_text(
++                "\n".join(
++                    [
++                        "#!/usr/bin/env bash",
++                        "set -euo pipefail",
++                        build_cmd,
++                        "",
++                    ]
++                ),
++                encoding="utf-8",
++            )
++            script_path.chmod(0o755)
++            build_cmd = f"bash {shlex.quote(str(script_path))}"
++        create_res = codeql.create_database(
+             source_root=str(repo_path),
+             db_path=str(db_path),
+             language="cpp",
+@@ -259,6 +282,10 @@ def bootstrap_seed_case(
+             overwrite=False,
+             cwd=str(repo_path),
+         )
++        if not create_res.get("ok"):
++            raise SeedMaterialError(
++                f"CodeQL database create failed: {create_res.get('stderr') or create_res}"
++            )
+ 
+     # 3) vuln line heuristic (for prompt windowing)
+     if not normalized.get("vulnerable_line"):

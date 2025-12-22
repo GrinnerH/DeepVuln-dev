@@ -131,18 +131,6 @@ def _maybe_localize_query(path_str: str, *, workspace_dir: Path) -> str:
         return path_str
 
 
-def _minimal_semantic_pack() -> str:
-    return "\n".join(
-        [
-            "import cpp",
-            "",
-            "/** No-op semantic pack to keep compilation stable. */",
-            "predicate _deepvuln_noop() { false }",
-            "",
-        ]
-    )
-
-
 # -----------------------------
 # Stage A: setup + ingest
 # -----------------------------
@@ -249,6 +237,18 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
 
     seed0 = seed_cases[0]
     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
+    baseline_query_path = seed0.get("baseline_query_path")
+    if baseline_query_path:
+        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
+    baseline_query_path = seed0.get("baseline_query_path")
+    if baseline_query_path:
+        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
+    baseline_query_path = seed0.get("baseline_query_path")
+    if baseline_query_path:
+        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
+    baseline_query_path = seed0.get("baseline_query_path")
+    if baseline_query_path:
+        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
 
     # --- Canonical schema only (NO key-guessing) ---
     repo_path = Path(seed0["repo_path"]).expanduser().resolve()
@@ -399,6 +399,8 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     pack_dir = ensure_dir(workspace_dir / "semantic_packs" / f"iter_{iter_idx:02d}")
     qll_path = pack_dir / "ProjectSemantics.qll"
     qlpack_path = pack_dir / "qlpack.yml"
+    queries_dir = ensure_dir(pack_dir / "queries")
+    wrapper_path = queries_dir / "_regression_with_semantics.ql"
 
     prompt = _SYNTHESIZE_PROMPT_TEMPLATE.format(
         cve_id=cve_id,
@@ -419,7 +421,7 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     if sanitized and "import cpp" not in sanitized.splitlines()[:5]:
         sanitized = "import cpp\n\n" + sanitized
     if not sanitized:
-        sanitized = _minimal_semantic_pack()
+        sanitized = "import cpp\n\n/** Empty semantic pack generated; requires refinement. */\n"
 
     raw_path = pack_dir / "ProjectSemantics.llm.qll"
     raw_path.write_text(raw_str, encoding="utf-8")
@@ -427,7 +429,6 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     banned_starts = ("select ", "from ", "query ")
     for line in sanitized.splitlines():
         if line.lstrip().startswith(banned_starts):
-            sanitized = _minimal_semantic_pack()
             break
 
     # The LLM should output CodeQL (.qll) content.
@@ -445,6 +446,12 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
             ),
             encoding="utf-8",
         )
+
+    if baseline_query_path:
+        base_text = safe_read_text(Path(baseline_query_path))
+        if "import ProjectSemantics" not in base_text:
+            base_text = "import ProjectSemantics\n" + base_text
+        wrapper_path.write_text(base_text, encoding="utf-8")
     logger.info("[synthesize] wrote semantic pack: %s", qll_path)
 
     artifact = {
@@ -489,6 +496,7 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
 
     diagnostics_dir = ensure_dir(workspace_dir / "diagnostics")
     compile_log_path = diagnostics_dir / f"{cve_id}_compile_iter_{iter_idx:02d}.json"
+    probe_sarif_path = diagnostics_dir / f"{cve_id}_compile_iter_{iter_idx:02d}.sarif"
     regression_sarif_path = diagnostics_dir / f"{cve_id}_regression_iter_{iter_idx:02d}.sarif"
     regression_log_path = diagnostics_dir / f"{cve_id}_regression_iter_{iter_idx:02d}.json"
 
@@ -514,8 +522,10 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
     if str(pack_dir) not in search_paths:
         search_paths.append(str(pack_dir))
 
-    compile_res = codeql.query_compile(
-        query_path=str(probe_path),
+    compile_res = codeql.analyze_database(
+        db_path=str(db_path),
+        query_or_suite_path=str(probe_path),
+        output_sarif_path=str(probe_sarif_path),
         additional_search_paths=search_paths or None,
         extra_args=None,
         cwd=None,
@@ -524,19 +534,6 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
 
     compile_ok = bool(compile_res.get("ok"))
     logger.info("[evaluate] compile_ok=%s compile_log=%s", compile_ok, compile_log_path)
-
-    if not compile_ok:
-        # Fallback to a minimal pack to keep the loop executable.
-        qll_path_p.write_text(_minimal_semantic_pack(), encoding="utf-8")
-        compile_res = codeql.query_compile(
-            query_path=str(probe_path),
-            additional_search_paths=search_paths or None,
-            extra_args=None,
-            cwd=None,
-        )
-        compile_log_path.write_text(json.dumps(compile_res, ensure_ascii=False, indent=2), encoding="utf-8")
-        compile_ok = bool(compile_res.get("ok"))
-        logger.info("[evaluate] compile_ok_after_fallback=%s compile_log=%s", compile_ok, compile_log_path)
 
     artifact_updated = dict(artifact)
     artifact_updated["compile_log_ref"] = {
@@ -566,11 +563,16 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
         }
 
     # ---- 2) Regression run on the seed DB ----
+    regression_query_to_run = regression_query_path
+    wrapper_path = pack_dir / "queries" / "_regression_with_semantics.ql"
+    if wrapper_path.exists():
+        regression_query_to_run = str(wrapper_path)
+
     regression_res: Dict[str, Any]
-    if regression_query_path:
+    if regression_query_to_run:
         regression_res = codeql.analyze_database(
             db_path=str(db_path),
-            query_or_suite_path=str(regression_query_path),
+            query_or_suite_path=str(regression_query_to_run),
             output_sarif_path=str(regression_sarif_path),
             additional_search_paths=search_paths or None,
             extra_args=None,
@@ -584,6 +586,8 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
             "stdout": "",
             "cmd": [],
         }
+    regression_res["semantic_pack_path"] = str(qll_path_p)
+    regression_res["regression_query_path"] = str(regression_query_to_run) if regression_query_to_run else ""
     regression_log_path.write_text(json.dumps(regression_res, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("[evaluate] regression_ok=%s sarif=%s", regression_res.get("ok"), regression_sarif_path)
 
@@ -839,9 +843,13 @@ Context:
 
 Rules:
 - You may import `cpp` and standard CodeQL C++ libraries.
+- You MUST define a `module ProjectSemantics {{ ... }}` or rely on top-level classes with the file name as module.
+- For sink/capacity gaps, prefer adding subclasses of CodeQL's `BufferAccess` / `BufferWrite`.
+- For taint/guard gaps, prefer defining a `TaintTracking::Configuration` and predicates like `isProjectGuard(...)`.
 - You should define predicates / classes that can be used by existing queries.
 - Prefer additive modeling (do not rewrite core libraries).
 - Do NOT output markdown.
+- Do NOT output query clauses (no `from`/`select`).
 
 Output: CodeQL (.qll) content only.
 """
