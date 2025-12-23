@@ -34,7 +34,7 @@
     "db_path": "/mnt/d/Work_space/DeepVuln-dev/artifacts/run/codeql_dbs/libtiff",
     "vulnerable_file": "tools/tiffcrop.c",
     "target_function": "extractImageSection",
-    "vulnerable_line": 554,
+    "vulnerable_line": 7908,
     "vuln_commit_sha": null,
     "fix_commit_sha": "236b7191f04c60d09ee836ae13b50f812c841047",
     "baseline_query_path": "/mnt/d/Work_space/codeql/qlpacks/codeql/cpp-queries/1.5.3/Security/CWE/CWE-119/OverflowBuffer.ql",

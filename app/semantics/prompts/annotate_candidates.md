@@ -8,11 +8,20 @@
   - kind: memcpy_like/strcpy_like/sprintf_like/custom_write
   - dest_arg: 目的缓冲区参数索引（从 0 开始）
   - size_arg: 写入长度参数索引；若未知/不适用请输出 null
-  - 只输出你有较高置信度的候选，必要时给出 confidence 与 rationale
+  - 只输出你有较高置信度的候选，必要时给出 rationale
 
 - capacity_macros / capacity_fields / guard_patterns：可为空数组，MVP 允许不填。
 
 输出要求：
 1) 只能输出 JSON，不能输出 markdown
 2) 不能输出任何 CodeQL 代码
-3) 如果无法确定 wrapper_models，至少输出空数组（不要编造）
+3) 必须包含以下键（即使为空）：wrapper_models, capacity_macros, capacity_fields, guard_patterns
+4) 如果无法确定 wrapper_models，至少输出空数组（不要编造）
+
+输出 JSON 示例（键必须齐全）：
+{
+  "wrapper_models": [],
+  "capacity_macros": [],
+  "capacity_fields": [],
+  "guard_patterns": []
+}

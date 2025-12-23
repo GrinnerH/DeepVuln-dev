@@ -7,6 +7,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from jsonschema import Draft202012Validator
 
 from app.agent.model import build_chat_model
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -434,6 +435,40 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     semantic_facts = json_loads_best_effort(sanitized, fallback={})
     if not isinstance(semantic_facts, dict):
         semantic_facts = {}
+
+    facts_schema_path = Path("app/semantics/schemas/semantic_facts.schema.json")
+    facts_schema = json_loads_best_effort(
+        safe_read_text(facts_schema_path),
+        fallback={},
+    )
+    schema_errors: List[str] = []
+    if not facts_schema:
+        schema_errors.append("SemanticFacts schema missing or unreadable.")
+    else:
+        validator = Draft202012Validator(facts_schema)
+        schema_errors.extend([e.message for e in sorted(validator.iter_errors(semantic_facts), key=lambda e: e.path)])
+
+    if schema_errors:
+        invalid_path = diagnostics_dir / f"{cve_id}_facts_invalid_iter_{iter_idx:02d}.json"
+        invalid_payload = {
+            "raw_content": raw_str,
+            "parsed": semantic_facts,
+            "errors": schema_errors,
+        }
+        invalid_path.write_text(json.dumps(invalid_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[synthesize] semantic_facts invalid; wrote %s", invalid_path)
+        return {
+            "active_semantic_artifact": {
+                "semantic_pack_path": "",
+                "facts_valid": False,
+                "facts_invalid_path": str(invalid_path),
+            },
+            "active_decision": {
+                "outcome": "continue",
+                "rationale": "SemanticFacts failed schema validation; see facts_invalid path.",
+            },
+        }
+
     semantic_facts.setdefault("wrapper_models", [])
     semantic_facts.setdefault("capacity_macros", [])
     semantic_facts.setdefault("capacity_fields", [])
@@ -474,18 +509,38 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
     vuln_line = int(seed0.get("vulnerable_line") or 1)
     codeql_search_paths = seed0.get("codeql_search_paths") or []
 
+    iter_idx = int(state.get("iteration_count", 0)) + 1
     artifact = state.get("active_semantic_artifact") or {}
+    if artifact.get("facts_valid") is False:
+        decision: ModelingDecision = {
+            "outcome": "continue",
+            "rationale": "SemanticFacts invalid; refine and retry.",
+        }
+        record: ModelingRecord = {
+            "iteration_index": iter_idx,
+            "diagnosis": state.get("active_diagnosis") or {},
+            "semantic_artifact": artifact,
+            "metrics": {"compile_ok": False, "seed_hit_rate": 0.0},
+            "decision": decision,
+        }
+        return {
+            "active_decision": decision,
+            "modeling_history": [record],
+            "iteration_count": iter_idx,
+            "is_converged": False,
+        }
+
     pack_dir = artifact.get("semantic_pack_path")
     if not pack_dir:
         decision = {"outcome": "halt", "rationale": "No active semantic pack path to compile/analyze."}
         return {"active_decision": decision, "is_converged": False}
 
     pack_dir_p = Path(pack_dir)
-    iter_idx = int(state.get("iteration_count", 0)) + 1
-
     diagnostics_dir = ensure_dir(workspace_dir / "diagnostics")
     compile_log_path = diagnostics_dir / f"{cve_id}_compile_iter_{iter_idx:02d}.json"
     probe_sarif_path = diagnostics_dir / f"{cve_id}_compile_iter_{iter_idx:02d}.sarif"
+    overlay_sarif_path = diagnostics_dir / f"{cve_id}_overlay_iter_{iter_idx:02d}.sarif"
+    overlay_log_path = diagnostics_dir / f"{cve_id}_overlay_iter_{iter_idx:02d}.json"
     regression_sarif_path = diagnostics_dir / f"{cve_id}_regression_iter_{iter_idx:02d}.sarif"
     regression_log_path = diagnostics_dir / f"{cve_id}_regression_iter_{iter_idx:02d}.json"
 
@@ -556,14 +611,38 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
         }
 
     # ---- 2) Regression run on the seed DB ----
-    regression_query_to_run = pack_dir_p / "queries" / "_regression_with_semantics.ql"
-    if regression_query_to_run.exists():
+    overlay_query_path = pack_dir_p / "queries" / "_regression_semantic_overlay.ql"
+    overlay_res: Dict[str, Any]
+    if overlay_query_path.exists():
+        overlay_res = codeql.analyze_database(
+            db_path=str(db_path),
+            query_or_suite_path=str(overlay_query_path),
+            output_sarif_path=str(overlay_sarif_path),
+            additional_search_paths=search_paths or None,
+            extra_args=["--rerun"],
+            cwd=None,
+        )
+    else:
+        overlay_res = {
+            "ok": False,
+            "returncode": 1,
+            "stderr": "Missing pack overlay query; cannot run overlay check.",
+            "stdout": "",
+            "cmd": [],
+        }
+    overlay_res["semantic_pack_path"] = str(pack_dir_p)
+    overlay_res["overlay_query_path"] = str(overlay_query_path)
+    logger.info("[evaluate] overlay_ok=%s sarif=%s", overlay_res.get("ok"), overlay_sarif_path)
+
+    regression_query_path = pack_dir_p / "queries" / "_regression_with_semantics.ql"
+    regression_res: Dict[str, Any]
+    if regression_query_path.exists():
         regression_res = codeql.analyze_database(
             db_path=str(db_path),
-            query_or_suite_path=str(regression_query_to_run),
+            query_or_suite_path=str(regression_query_path),
             output_sarif_path=str(regression_sarif_path),
             additional_search_paths=search_paths or None,
-            extra_args=None,
+            extra_args=["--rerun"],
             cwd=None,
         )
     else:
@@ -575,13 +654,22 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
             "cmd": [],
         }
     regression_res["semantic_pack_path"] = str(pack_dir_p)
-    regression_res["regression_query_path"] = str(regression_query_to_run)
+    regression_res["regression_query_path"] = str(regression_query_path)
     regression_log_path.write_text(json.dumps(regression_res, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("[evaluate] regression_ok=%s sarif=%s", regression_res.get("ok"), regression_sarif_path)
 
     # ---- 3) Compute seed hit rate (proxy oracle) ----
-    locs = _parse_sarif_locations(regression_sarif_path) if regression_sarif_path.exists() else []
-    hit = _hit_vuln_site(locs, vuln_file_rel=vuln_file_rel, vuln_line=vuln_line, radius=3)
+    overlay_count = 0
+    overlay_notifications = 0
+    if overlay_sarif_path.exists():
+        overlay_count = _count_sarif_results(overlay_sarif_path)
+        overlay_notifications = _count_sarif_tool_notifications(overlay_sarif_path)
+        overlay_res["overlay_results_count"] = overlay_count
+        overlay_res["overlay_notifications_count"] = overlay_notifications
+        overlay_log_path.write_text(json.dumps(overlay_res, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    reg_locs = _parse_sarif_locations(regression_sarif_path) if regression_sarif_path.exists() else []
+    hit = _hit_vuln_site(reg_locs, vuln_file_rel=vuln_file_rel, vuln_line=vuln_line, radius=3)
     seed_hit_rate = 1.0 if hit else 0.0
 
     outcome: ModelingDecision["outcome"]
@@ -608,7 +696,7 @@ def evaluate_modeling_success(state: DeepVulnState) -> Dict[str, Any]:
         "iteration_index": iter_idx,
         "diagnosis": state.get("active_diagnosis") or {},
         "semantic_artifact": artifact_updated,
-        "metrics": {"compile_ok": True, "seed_hit_rate": seed_hit_rate},
+        "metrics": {"compile_ok": True, "seed_hit_rate": seed_hit_rate, "overlay_modeled_count": overlay_count},
         "decision": decision,
     }
 
@@ -749,6 +837,34 @@ def _hit_vuln_site(locs: List[Dict[str, Any]], vuln_file_rel: str, vuln_line: in
     return False
 
 
+def _count_sarif_results(sarif_path: Path) -> int:
+    """Count SARIF results across all runs."""
+    try:
+        sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    total = 0
+    runs = sarif.get("runs") or []
+    for run in runs:
+        total += len(run.get("results") or [])
+    return total
+
+
+def _count_sarif_tool_notifications(sarif_path: Path) -> int:
+    """Count toolExecutionNotifications across all runs."""
+    try:
+        sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    total = 0
+    runs = sarif.get("runs") or []
+    for run in runs:
+        invocations = run.get("invocations") or []
+        for inv in invocations:
+            total += len(inv.get("toolExecutionNotifications") or [])
+    return total
+
+
 # -----------------------------
 # Prompts
 # -----------------------------
@@ -821,5 +937,14 @@ _ANNOTATE_PROMPT_FALLBACK = (
     "Rules:\n"
     "- Output JSON only (no markdown).\n"
     "- Do not output any CodeQL code.\n"
+    "- The output must include wrapper_models, capacity_macros, capacity_fields, guard_patterns.\n"
     "- If unsure, output empty arrays for wrapper_models/capacity_macros/capacity_fields/guard_patterns.\n"
+    "\n"
+    "Example:\n"
+    "{\n"
+    "  \"wrapper_models\": [],\n"
+    "  \"capacity_macros\": [],\n"
+    "  \"capacity_fields\": [],\n"
+    "  \"guard_patterns\": []\n"
+    "}\n"
 )

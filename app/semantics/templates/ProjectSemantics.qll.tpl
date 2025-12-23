@@ -12,32 +12,10 @@ module ProjectSemantics {
 
   // -------- Wrapper modeling (primary effectiveness lever) --------
 
-  predicate isModeledWrapperName(string n) {
-    // __WRAPPER_NAME_OR_LIST__
-  }
+  // __WRAPPER_CLASS_DEFS__
 
-  class WrapperModeledBA extends BufferAccess {
-    WrapperModeledBA() {
-      exists(FunctionCall c |
-        isModeledWrapperName(c.getTarget().getName()) and
-        this = c
-      )
-    }
-
-    override string getName() {
-      result = this.(FunctionCall).getTarget().getName()
-    }
-
-    override Expr getBuffer(string bufferDesc, int accessType) {
-      result = this.(FunctionCall).getArgument(__DEST_ARG__) and
-      bufferDesc = "destination buffer" and
-      accessType = 2
-    }
-
-    override Expr getSizeExpr() {
-      // If __SIZE_ARG__ is -1 => treat as unbounded/unknown size (return none()).
-      __SIZE_EXPR_BODY__
-    }
+  predicate isModeledWrapperAccess(BufferAccess ba) {
+    // __WRAPPER_ACCESS_PRED__
   }
 
   // -------- Capacity semantics (optional, for later expansion) --------

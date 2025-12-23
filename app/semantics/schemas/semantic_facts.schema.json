@@ -19,7 +19,6 @@
           "dest_arg": { "type": "integer", "minimum": 0 },
           "size_arg": { "type": ["integer", "null"], "minimum": 0 },
           "access_type": { "type": "string", "enum": ["write", "read", "readwrite"], "default": "write" },
-          "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
           "rationale": { "type": "string" }
         },
         "required": ["name", "kind", "dest_arg", "size_arg"]
