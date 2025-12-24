@@ -238,18 +238,6 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
 
     seed0 = seed_cases[0]
     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
-    baseline_query_path = seed0.get("baseline_query_path")
-    if baseline_query_path:
-        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
-    baseline_query_path = seed0.get("baseline_query_path")
-    if baseline_query_path:
-        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
-    baseline_query_path = seed0.get("baseline_query_path")
-    if baseline_query_path:
-        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
-    baseline_query_path = seed0.get("baseline_query_path")
-    if baseline_query_path:
-        baseline_query_path = str(Path(baseline_query_path).expanduser().resolve())
 
     # --- Canonical schema only (NO key-guessing) ---
     repo_path = Path(seed0["repo_path"]).expanduser().resolve()
@@ -326,6 +314,12 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
 
     # ---- 2) Vulnerable code window evidence ----
     abs_vuln_file = repo_path / vuln_file_rel
+    logger.info(
+        "[diagnose] vuln_file_rel=%s abs_vuln_file=%s exists=%s",
+        vuln_file_rel,
+        abs_vuln_file,
+        abs_vuln_file.exists(),
+    )
     code_snip = _read_code_window(abs_vuln_file, line=vuln_line, window=25)
     snippet_path = evidence_dir / f"{cve_id}_{_sanitize_filename(vuln_file_rel)}_L{vuln_line}.code.txt"
     snippet_path.write_text(code_snip, encoding="utf-8")
@@ -340,11 +334,21 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
 
     # ---- 3) LLM: failure-driven diagnosis ----
     # Prompt constraints: LLM suggests semantics; CodeQL remains the final verifier.
+    baseline_query_body = ""
+    if baseline_query_path:
+        try:
+            baseline_query_body = safe_read_text(Path(baseline_query_path))
+        except Exception:
+            baseline_query_body = ""
+    baseline_sarif_summary = _summarize_sarif_results(baseline_sarif_path)
+
     prompt = _DIAGNOSE_PROMPT_TEMPLATE.format(
         cve_id=cve_id,
         baseline_summary=baseline_summary,
         baseline_log_path=str(baseline_log_path),
         baseline_sarif_path=str(baseline_sarif_path),
+        baseline_sarif_summary=baseline_sarif_summary,
+        baseline_query_body=baseline_query_body,
         vulnerable_file=vuln_file_rel,
         vulnerable_line=vuln_line,
         code_window=code_snip,
@@ -359,6 +363,7 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
 
     raw = runnable.invoke(messages)
     raw_text = getattr(raw, "content", raw)
+    print(f"[STEP1] raw_text:\n{raw_text}")
 
     parsed = json_loads_best_effort(raw_text, fallback={})
     gap_kind = parsed.get("gap_kind", "unknown")
@@ -886,6 +891,9 @@ Inputs:
 - Baseline summary: {baseline_summary}
 - Baseline log path: {baseline_log_path}
 - Baseline SARIF path: {baseline_sarif_path}
+- Baseline SARIF summary: {baseline_sarif_summary}
+- Baseline query body:
+{baseline_query_body}
 
 Vulnerable site anchor:
 - File: {vulnerable_file}
@@ -928,6 +936,23 @@ Output STRICT JSON only (no markdown):
   ]
 }}
 """
+
+
+def _summarize_sarif_results(sarif_path: Path) -> str:
+    try:
+        sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"<<FAILED_TO_READ_SARIF error={exc}>>"
+    runs = sarif.get("runs") or []
+    total = 0
+    rule_ids: Dict[str, int] = {}
+    for run in runs:
+        results = run.get("results") or []
+        total += len(results)
+        for r in results:
+            rid = r.get("ruleId") or "UNKNOWN_RULE"
+            rule_ids[rid] = rule_ids.get(rid, 0) + 1
+    return json.dumps({"total_results": total, "rule_counts": rule_ids}, ensure_ascii=False)
 
 
 _ANNOTATE_PROMPT_FALLBACK = (
