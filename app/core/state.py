@@ -40,6 +40,7 @@ class GapDiagnosis(TypedDict, total=False):
 
     # Optional: when nodes consult RAGFlow MCP (CodeQL docs), store citations/refs here.
     docs_citation_refs: List[str]
+    learned_patterns: List[Dict[str, Any]]
 
 
 class SemanticArtifact(TypedDict, total=False):

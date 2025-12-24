@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from typing import Any, Dict
 
+from langchain.tools import tool
 """
 Placeholder facade for RAGFlow MCP usage.
 
@@ -32,3 +34,11 @@ class RAGFlowMCPClient:
             "citation_refs": [],
             "results": [],
         }
+
+
+@tool
+def ragflow_search_tool(query: str, top_k: int = 5) -> str:
+    """Search RAGFlow MCP for relevant documents."""
+    client = RAGFlowMCPClient.from_env()
+    res = client.search(query=query, top_k=top_k)
+    return json.dumps(res, ensure_ascii=False)

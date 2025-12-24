@@ -15,11 +15,14 @@ CodeQL MCP server) without rewriting the LangGraph nodes.
 """
 
 import os
+import json
 import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from langchain.tools import tool
 
 
 class CodeQLExecutionError(RuntimeError):
@@ -226,6 +229,7 @@ class CodeQLMCPClient:
         result.update({"ok": result["returncode"] == 0})
         return result
 
+
     # -------------------------
     # Query/analyze operations
     # -------------------------
@@ -309,3 +313,23 @@ class CodeQLMCPClient:
         result = _run(cmd, cwd=cwd)
         result.update({"ok": result["returncode"] == 0})
         return result
+
+
+@tool
+def codeql_analyze_tool(
+    db_path: str,
+    query_path: str,
+    output_sarif_path: str,
+    search_paths: Optional[List[str]] = None,
+) -> str:
+    """Run CodeQL database analyze for diagnostic queries."""
+    codeql = CodeQLMCPClient()
+    res = codeql.analyze_database(
+        db_path=db_path,
+        query_or_suite_path=query_path,
+        output_sarif_path=output_sarif_path,
+        additional_search_paths=search_paths or None,
+        extra_args=["--rerun"],
+        cwd=None,
+    )
+    return json.dumps(res, ensure_ascii=False)

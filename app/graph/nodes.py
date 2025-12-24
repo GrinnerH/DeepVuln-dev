@@ -9,10 +9,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from jsonschema import Draft202012Validator
 
-from app.agent.model import build_chat_model
+from app.agent.model import build_chat_model, build_model
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_community.tools.file_management import ReadFileTool, ListDirectoryTool
+from langchain_community.tools.shell import ShellTool
 from app.core.state import DeepVulnState, EvidenceRef, GapDiagnosis, ModelingDecision, ModelingRecord
-from app.mcp.codeql_mcp import CodeQLMCPClient, CodeQLExecutionError
+from app.mcp.codeql_mcp import CodeQLMCPClient, CodeQLExecutionError, codeql_analyze_tool
+from app.mcp.ragflow_mcp import ragflow_search_tool
 from utils.io import ensure_dir, safe_read_text
 from utils.jsonx import ensure_list, json_loads_best_effort
 from app.semantics.builder import build_semantic_pack
@@ -382,6 +388,81 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
     }
 
     logger.info("[diagnose] gap_kind=%s modeling_plan_items=%d", gap_kind, len(modeling_plan))
+
+    # ---- 4) Pattern abstraction agent (skills + tools) ----
+    class _AgentToolLogger(BaseCallbackHandler):
+        def __init__(self) -> None:
+            self.records: List[Dict[str, Any]] = []
+
+        def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs: Any) -> None:
+            self.records.append(
+                {"event": "tool_start", "name": serialized.get("name"), "input": input_str}
+            )
+
+        def on_tool_end(self, output: str, **kwargs: Any) -> None:
+            self.records.append({"event": "tool_end", "output": output})
+
+    repo_root = Path(".").resolve()
+    fs_tools = [
+        ReadFileTool(root_dir=str(repo_root)),
+        ListDirectoryTool(root_dir=str(repo_root)),
+    ]
+    shell_tool = ShellTool()
+    tools = [load_skill, ragflow_search_tool, codeql_analyze_tool, *fs_tools, shell_tool]
+
+    agent_system_prompt = (
+        "You are a diagnosis-and-abstraction agent.\n"
+        "Always call load_skill('diagnose_and_abstract') first and follow it strictly.\n"
+        "You MUST call ragflow_search_tool to align with CodeQL docs before final output.\n"
+        "You may use file tools and ShellTool for read-only commands (ls, rg, find, cat, sed).\n"
+        "Do NOT modify files or run destructive commands.\n"
+        "Return ONLY JSON as specified by the skill.\n"
+    )
+    agent = create_agent(
+        model=build_model(),
+        tools=tools,
+        system_prompt=agent_system_prompt,
+    )
+
+    agent_input = "\n".join(
+        [
+            "Seed diagnosis context:",
+            json.dumps(diagnosis, ensure_ascii=False, indent=2),
+            "",
+            f"Repo path: {repo_path}",
+            f"Vulnerable file: {vuln_file_rel}",
+            f"Vulnerable line: {vuln_line}",
+            f"Baseline query path: {baseline_query_path}",
+            f"Baseline SARIF path: {baseline_sarif_path}",
+            "",
+            "Code window:",
+            code_snip,
+        ]
+    )
+
+    tool_logger = _AgentToolLogger()
+    try:
+        agent_result = agent.invoke({"input": agent_input}, config={"callbacks": [tool_logger]})
+        agent_text = agent_result.get("output") if isinstance(agent_result, dict) else str(agent_result)
+    except Exception as exc:
+        agent_text = f"<<AGENT_FAILURE error={exc}>>"
+
+    parsed_patterns = json_loads_best_effort(_strip_markdown_fences(agent_text).strip(), fallback={})
+    learned_patterns = parsed_patterns.get("pattern_hypotheses") if isinstance(parsed_patterns, dict) else None
+    if not isinstance(learned_patterns, list):
+        learned_patterns = []
+
+    pattern_path = diagnostics_dir / f"{cve_id}_pattern_hypotheses.json"
+    pattern_payload = {
+        "raw_output": agent_text,
+        "parsed": parsed_patterns,
+        "tool_log": tool_logger.records,
+    }
+    pattern_path.write_text(json.dumps(pattern_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    diagnosis["pattern_hypotheses_ref"] = str(pattern_path)
+    diagnosis["learned_patterns"] = learned_patterns
+    logger.info("[diagnose] wrote pattern hypotheses: %s", pattern_path)
+
     return {"active_diagnosis": diagnosis}
 
 
@@ -422,6 +503,9 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     prompt = "\n\n".join(
         [
             prompt_body.strip(),
+            "",
+            "Learned patterns (prioritize these over raw diagnosis):",
+            json.dumps(learned_patterns, ensure_ascii=False, indent=2),
             "",
             "SemanticCandidates JSON:",
             json.dumps(candidates, ensure_ascii=False, indent=2),
@@ -973,3 +1057,4 @@ _ANNOTATE_PROMPT_FALLBACK = (
     "  \"guard_patterns\": []\n"
     "}\n"
 )
+    learned_patterns = diagnosis.get("learned_patterns") or []
