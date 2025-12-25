@@ -12,13 +12,14 @@ from jsonschema import Draft202012Validator
 from app.agent.model import build_chat_model, build_model
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain.agents import create_agent
-from langchain.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_community.tools.file_management import ReadFileTool, ListDirectoryTool
 from langchain_community.tools.shell import ShellTool
 from app.core.state import DeepVulnState, EvidenceRef, GapDiagnosis, ModelingDecision, ModelingRecord
 from app.mcp.codeql_mcp import CodeQLMCPClient, CodeQLExecutionError, codeql_analyze_tool
 from app.mcp.ragflow_mcp import ragflow_search_tool
+from app.skills.tools import load_skill
+from app.skills.middleware import SkillMiddleware
 from utils.io import ensure_dir, safe_read_text
 from utils.jsonx import ensure_list, json_loads_best_effort
 from app.semantics.builder import build_semantic_pack
@@ -69,6 +70,13 @@ def _init_file_logger(*, logs_dir: Path, run_id: Optional[str] = None) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
+    # Also log to stdout for step-by-step feedback (idempotent).
+    has_stream = any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+    if not has_stream:
+        sh = logging.StreamHandler()
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
     # Do not force global basicConfig; keep integration-friendly.
     logger.setLevel(logging.INFO)
 
@@ -400,15 +408,19 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
             )
 
         def on_tool_end(self, output: str, **kwargs: Any) -> None:
-            self.records.append({"event": "tool_end", "output": output})
+            self.records.append({"event": "tool_end", "output": str(output)})
 
     repo_root = Path(".").resolve()
     fs_tools = [
         ReadFileTool(root_dir=str(repo_root)),
         ListDirectoryTool(root_dir=str(repo_root)),
     ]
-    shell_tool = ShellTool()
-    tools = [load_skill, ragflow_search_tool, codeql_analyze_tool, *fs_tools, shell_tool]
+    tools = [ragflow_search_tool, codeql_analyze_tool, *fs_tools]
+    try:
+        shell_tool = ShellTool()
+        tools.append(shell_tool)
+    except Exception as exc:
+        logger.warning("[diagnose] ShellTool unavailable: %s", exc)
 
     agent_system_prompt = (
         "You are a diagnosis-and-abstraction agent.\n"
@@ -422,6 +434,7 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
         model=build_model(),
         tools=tools,
         system_prompt=agent_system_prompt,
+        middleware=[SkillMiddleware()],
     )
 
     agent_input = "\n".join(
@@ -444,6 +457,8 @@ def diagnose_vulnerability_gap(state: DeepVulnState) -> Dict[str, Any]:
     try:
         agent_result = agent.invoke({"input": agent_input}, config={"callbacks": [tool_logger]})
         agent_text = agent_result.get("output") if isinstance(agent_result, dict) else str(agent_result)
+        if agent_text is None:
+            agent_text = ""
     except Exception as exc:
         agent_text = f"<<AGENT_FAILURE error={exc}>>"
 
@@ -478,6 +493,7 @@ def synthesize_semantic_model(state: DeepVulnState) -> Dict[str, Any]:
     cve_id = seed0.get("cve_id") or "UNKNOWN_CVE"
 
     diagnosis = state.get("active_diagnosis") or {}
+    learned_patterns = diagnosis.get("learned_patterns") or []
     iter_idx = int(state.get("iteration_count", 0)) + 1
     pack_dir = ensure_dir(workspace_dir / "semantic_packs" / f"iter_{iter_idx:02d}" / "pack")
     diagnostics_dir = ensure_dir(workspace_dir / "diagnostics")
@@ -1057,4 +1073,3 @@ _ANNOTATE_PROMPT_FALLBACK = (
     "  \"guard_patterns\": []\n"
     "}\n"
 )
-    learned_patterns = diagnosis.get("learned_patterns") or []
