@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Dict, List
 
+import logging
+
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import SystemMessage
 
 from utils.io import safe_read_text
+from app.skills.tools import load_skill
 
 
 def _extract_description(text: str) -> str:
@@ -19,6 +22,8 @@ def _extract_description(text: str) -> str:
 
 class SkillMiddleware(AgentMiddleware):
     """Inject available skill descriptions into the system prompt."""
+
+    tools = [load_skill]
 
     def __init__(self) -> None:
         skills_root = Path(__file__).resolve().parent
@@ -33,6 +38,10 @@ class SkillMiddleware(AgentMiddleware):
             )
         skills_list = [f"- **{s['name']}**: {s['description']}" for s in skills]
         self.skills_prompt = "\n".join(skills_list)
+        logging.getLogger("deepvuln.v2").info(
+            "[skills] middleware initialized skills=%s",
+            [s["name"] for s in skills],
+        )
 
     def wrap_model_call(
         self,
@@ -44,6 +53,10 @@ class SkillMiddleware(AgentMiddleware):
             f"{self.skills_prompt}\n\n"
             "Use the load_skill tool when you need detailed information "
             "about handling a specific type of request."
+        )
+        logging.getLogger("deepvuln.v2").info(
+            "[skills] injecting skills into system prompt chars=%d",
+            len(skills_addendum),
         )
         new_content = list(request.system_message.content_blocks) + [
             {"type": "text", "text": skills_addendum}

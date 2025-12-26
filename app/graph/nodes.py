@@ -16,6 +16,8 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_community.tools.file_management import ReadFileTool, ListDirectoryTool
 from langchain_community.tools.shell import ShellTool
 from app.core.state import DeepVulnState, EvidenceRef, GapDiagnosis, ModelingDecision, ModelingRecord
+
+from langchain_mcp_adapters.tools import load_mcp_tools
 from app.mcp.codeql_mcp import CodeQLMCPClient, CodeQLExecutionError, codeql_analyze_tool
 from app.mcp.ragflow_mcp import ragflow_search_tool
 from app.skills.tools import load_skill
